@@ -7,6 +7,7 @@ import {
   findBatchById,
   findBatchByIdForUser,
   findOpenBatchForUser,
+  listBatchesForUser,
 } from "../models/batch.js";
 import {
   createFileUpload,
@@ -459,6 +460,32 @@ router.post(
   uploadSingle,
   (req, res, next) => handleUpload("postload", req, res, next),
 );
+
+router.get("/", requireAuth, requireRole("normal_user", "admin"), async (req, res, next) => {
+  try {
+    const page = Math.max(Number(req.query.page) || 1, 1);
+    const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
+    const offset = (page - 1) * limit;
+
+    const result = await listBatchesForUser(db, {
+      userId: req.user.id,
+      limit,
+      offset,
+    });
+
+    return res.status(200).json({
+      batches: result.batches,
+      pagination: {
+        page,
+        limit: result.limit,
+        total: result.total,
+        totalPages: result.total === 0 ? 0 : Math.ceil(result.total / result.limit),
+      },
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
 
 /**
  * Synchronous run: no job queue exists in this project.

@@ -1,3 +1,4 @@
+import { randomUUID } from "crypto";
 import { Router } from "express";
 import multer from "multer";
 import {
@@ -19,7 +20,11 @@ import {
   SUPPORTED_BUSINESS_OBJECTS,
   mapPreloadToSapFields,
 } from "../services/sapMetadataService.js";
-import { findValidationRulesById } from "../models/validationRules.js";
+import {
+  findLatestValidationRulesByBusinessObject,
+  findLatestValidationRulesGrouped,
+  findValidationRulesById,
+} from "../models/validationRules.js";
 import {
   createCleanupSession,
   findCleanupSessionForUser,
@@ -30,8 +35,10 @@ import { runValidationAutoFix } from "../services/validationAutoFixService.js";
 import {
   buildRefinedValidationKey,
   buildSignedDownloadResponse,
+  buildValidationInputKey,
   uploadFile,
 } from "../services/s3Service.js";
+import { isValidationEngineConfigured, runValidationEngine } from "../services/validationEngineClient.js";
 import { alignValidationOutputToSapFields } from "../services/validationColumnMapping.js";
 import { remapRowsToPreloadColumns, remapRowsToSapColumns } from "../constants/fieldColumnAliases.js";
 
@@ -60,6 +67,188 @@ function collectColumns(rows) {
     }
   }
   return [...columns];
+}
+
+function parseS3KeysFromBody(body) {
+  const raw = body?.s3Keys ?? body?.s3Key ?? body?.inputs;
+  if (!raw) return [];
+  if (Array.isArray(raw)) {
+    return raw
+      .map((item) => (typeof item === "string" ? { s3Key: item } : item))
+      .filter((item) => item?.s3Key);
+  }
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed) return [];
+    try {
+      const parsed = JSON.parse(trimmed);
+      return parseS3KeysFromBody({ s3Keys: parsed });
+    } catch {
+      return trimmed.split(",").map((key) => ({ s3Key: key.trim() })).filter((item) => item.s3Key);
+    }
+  }
+  return [];
+}
+
+/**
+ * Upload preload file(s) to S3, pass saved validation_rules to the Python
+ * engine, and return per-scenario parsed output keys for download.
+ */
+router.post(
+  "/execute-preload",
+  requireAuth,
+  requireRole("normal_user", "admin"),
+  upload.array("files", 20),
+  async (req, res, next) => {
+    try {
+      const jobId = String(req.body?.jobId || randomUUID());
+      const files = Array.isArray(req.files) ? req.files : [];
+      const inputRefs = parseS3KeysFromBody(req.body);
+
+      for (const [index, file] of files.entries()) {
+        if (!isAllowedUploadFilename(file.originalname)) {
+          return res.status(400).json({ error: "Only .csv and .xlsx files are allowed" });
+        }
+        const key = buildValidationInputKey({
+          jobId,
+          originalFilename: file.originalname,
+          index,
+        });
+        await uploadFile({
+          key,
+          body: file.buffer,
+          contentType: contentTypeForFilename(file.originalname),
+        });
+        inputRefs.push({ s3Key: key, filename: file.originalname });
+      }
+
+      if (!inputRefs.length) {
+        return res.status(400).json({
+          error: "Upload one or more files (field name: files) or pass s3Key/s3Keys",
+        });
+      }
+
+      const ruleRows = await findLatestValidationRulesGrouped();
+      if (!ruleRows.length) {
+        return res.status(404).json({
+          error: "No saved validation rules. Generate and save rules in Admin first.",
+        });
+      }
+
+      const rulesByBusinessObject = Object.fromEntries(
+        ruleRows.map((row) => [row.business_object, row.rules]),
+      );
+
+      const engineResult = await runValidationEngine({
+        jobId,
+        inputs: inputRefs,
+        rulesByBusinessObject,
+        outputFormat: req.body?.outputFormat || undefined,
+      });
+
+      const scenarios = [];
+      for (const scenario of engineResult.scenarios || []) {
+        let download = null;
+        try {
+          download = await buildSignedDownloadResponse(
+            scenario.s3Key,
+            scenario.filename,
+          );
+        } catch (err) {
+          console.error("[validation] signed URL failed:", err.message);
+        }
+        scenarios.push({ ...scenario, download });
+      }
+
+      return res.status(200).json({
+        ok: true,
+        jobId: engineResult.jobId || jobId,
+        scenarios,
+        unclassified: engineResult.unclassified || [],
+        errors: engineResult.errors || [],
+        ruleSets: ruleRows.map((row) => ({
+          id: row.id,
+          businessObject: row.business_object,
+          createdAt: row.created_at,
+        })),
+      });
+    } catch (err) {
+      return next(err);
+    }
+  },
+);
+
+function toDetectorLabel(manualBo) {
+  if (isBusinessObject(manualBo)) {
+    return mapRulesBusinessObjectToDetector(manualBo);
+  }
+  return String(manualBo).toUpperCase().replace(/\s+/g, "_");
+}
+
+/**
+ * Evaluate the same parsed rows the cleanup session will store, via FastAPI.
+ * Serializes first-sheet rows so the engine sees the same data Node parsed.
+ */
+async function evaluateCleanupWithFastApi({
+  rows,
+  filename,
+  forcedBusinessObject,
+}) {
+  const ruleRows = await findLatestValidationRulesGrouped();
+  if (!ruleRows.length) {
+    const err = new Error(
+      "No saved validation rules. Generate and save rules in Admin first.",
+    );
+    err.status = 404;
+    throw err;
+  }
+
+  const jobId = randomUUID();
+  const body = serializeRowsToBuffer(rows, filename);
+  const key = buildValidationInputKey({
+    jobId,
+    originalFilename: filename,
+    index: 0,
+  });
+  await uploadFile({
+    key,
+    body,
+    contentType: contentTypeForFilename(filename),
+  });
+
+  const engineResult = await runValidationEngine({
+    jobId,
+    inputs: [
+      {
+        s3Key: key,
+        filename,
+        businessObject: forcedBusinessObject || undefined,
+      },
+    ],
+    rulesByBusinessObject: Object.fromEntries(
+      ruleRows.map((row) => [row.business_object, row.rules]),
+    ),
+  });
+
+  const scenario = (engineResult.scenarios || [])[0];
+  const unclassified = (engineResult.unclassified || [])[0];
+  if (!scenario) {
+    return { ok: false, unclassified, errors: engineResult.errors || [], ruleRows };
+  }
+
+  const rulesBusinessObject = scenario.rulesBusinessObject;
+  const ruleSetRow =
+    ruleRows.find((row) => row.business_object === rulesBusinessObject) ||
+    (await findLatestValidationRulesByBusinessObject(rulesBusinessObject));
+
+  return {
+    ok: true,
+    scenario,
+    ruleSetRow,
+    ruleRows,
+    unclassified: engineResult.unclassified || [],
+    errors: engineResult.errors || [],
+  };
 }
 
 async function uploadRefinedValidationFile(session, refinedRows) {
@@ -127,8 +316,82 @@ router.post(
       let detection;
       let detectorLabel;
       let rulesBusinessObject;
+      let evalResult;
+      let evaluator = String(process.env.VALIDATION_LAMBDA_MODE || "local");
 
-      if (manualBo) {
+      if (isValidationEngineConfigured()) {
+        if (manualBo) {
+          if (isBusinessObject(manualBo)) {
+            rulesBusinessObject = manualBo;
+            detectorLabel = toDetectorLabel(manualBo);
+          } else {
+            const mapped = mapDetectorToRulesBusinessObject(manualBo);
+            if (!mapped) {
+              return res.status(400).json({
+                error: `Unsupported businessObject. Use one of: ${BUSINESS_OBJECTS.join(", ")} or ${SUPPORTED_BUSINESS_OBJECTS.join(", ")}`,
+              });
+            }
+            rulesBusinessObject = mapped;
+            detectorLabel = String(manualBo).toUpperCase().replace(/\s+/g, "_");
+          }
+        }
+
+        const fastApi = await evaluateCleanupWithFastApi({
+          rows: originalRows,
+          filename: req.file.originalname,
+          forcedBusinessObject: detectorLabel,
+        });
+
+        if (!fastApi.ok) {
+          if (!fastApi.unclassified && (fastApi.errors || []).length) {
+            const err = new Error(
+              fastApi.errors[0]?.error || "Validation engine failed",
+            );
+            err.status = 502;
+            throw err;
+          }
+          const unclassified = fastApi.unclassified;
+          const det = unclassified?.detection || {};
+          return res.status(422).json({
+            needs_business_object: true,
+            error:
+              det.message ||
+              unclassified?.reason ||
+              "Could not auto-detect business object",
+            detection: {
+              businessObject: det.businessObject ?? null,
+              confidence: det.confidence ?? null,
+              reasoning: det.reasoning ?? unclassified?.reason ?? null,
+              error: det.error ?? null,
+            },
+            candidates: det.candidates || [...SUPPORTED_BUSINESS_OBJECTS],
+          });
+        }
+
+        detectorLabel = fastApi.scenario.scenario;
+        rulesBusinessObject = fastApi.scenario.rulesBusinessObject;
+        detection = {
+          source: manualBo ? "manual" : "auto",
+          businessObject: detectorLabel,
+          confidence: fastApi.scenario.detection?.confidence,
+          reasoning: fastApi.scenario.detection?.reasoning,
+          modelId: fastApi.scenario.detection?.modelId,
+        };
+        evalResult = {
+          findings: fastApi.scenario.findings || [],
+          report: fastApi.scenario.report || {},
+          summary: fastApi.scenario.summary,
+          ruleSet: {
+            id: fastApi.ruleSetRow?.id,
+            business_object: rulesBusinessObject,
+            created_at: fastApi.ruleSetRow?.created_at,
+          },
+          rulesSnapshot:
+            fastApi.ruleSetRow?.rules ?? { businessObject: rulesBusinessObject },
+        };
+        evaluator = "fastapi";
+        console.log("[validation] evaluator=fastapi");
+      } else if (manualBo) {
         if (isBusinessObject(manualBo)) {
           rulesBusinessObject = manualBo;
           detectorLabel = manualBo;
@@ -207,32 +470,45 @@ router.post(
       const columns = sapMapping.sapColumns;
       const sapFieldNames = sapMapping.sapFieldNames || columns;
 
-      const lambdaResult = await runValidationRulesLambda({
-        businessObject: rulesBusinessObject,
-        rows: mappedRows,
-        applyFixes: true,
-      });
+      if (!evalResult) {
+        const lambdaResult = await runValidationRulesLambda({
+          businessObject: rulesBusinessObject,
+          rows: mappedRows,
+          applyFixes: true,
+        });
+        const ruleSetRow = await findValidationRulesById(lambdaResult.ruleSet.id);
+        evalResult = {
+          findings: lambdaResult.findings,
+          report: lambdaResult.report,
+          summary: lambdaResult.summary,
+          ruleSet: lambdaResult.ruleSet,
+          rulesSnapshot:
+            ruleSetRow?.rules ?? { businessObject: rulesBusinessObject },
+          refinedRows: lambdaResult.refinedRows,
+          appliedFixes: lambdaResult.appliedFixes,
+          skippedFixes: lambdaResult.skippedFixes,
+          evaluator: lambdaResult.evaluator,
+        };
+        evaluator = lambdaResult.evaluator || evaluator;
+      }
 
       const aligned = alignValidationOutputToSapFields(
-        lambdaResult.findings,
-        lambdaResult.report,
+        evalResult.findings,
+        evalResult.report,
         columnMapping,
       );
 
-      const ruleSetRow = await findValidationRulesById(lambdaResult.ruleSet.id);
-      const rulesSnapshot = ruleSetRow?.rules ?? { businessObject: rulesBusinessObject };
-
-      let refinedRows = Array.isArray(lambdaResult.refinedRows)
-        ? lambdaResult.refinedRows
+      let refinedRows = Array.isArray(evalResult.refinedRows)
+        ? evalResult.refinedRows
         : mappedRows;
-      let appliedFixes = Array.isArray(lambdaResult.appliedFixes)
-        ? lambdaResult.appliedFixes
+      let appliedFixes = Array.isArray(evalResult.appliedFixes)
+        ? evalResult.appliedFixes
         : [];
-      let skippedFixes = Array.isArray(lambdaResult.skippedFixes)
-        ? lambdaResult.skippedFixes
+      let skippedFixes = Array.isArray(evalResult.skippedFixes)
+        ? evalResult.skippedFixes
         : [];
 
-      if (!Array.isArray(lambdaResult.refinedRows)) {
+      if (!Array.isArray(evalResult.refinedRows)) {
         const { applyAllFindings } = await import("../services/ruleFixService.js");
         const fixed = applyAllFindings(mappedRows, aligned.findings);
         refinedRows = fixed.rows;
@@ -259,8 +535,8 @@ router.post(
         businessObject: rulesBusinessObject,
         detectorLabel,
         detection,
-        ruleSetId: lambdaResult.ruleSet.id,
-        rulesSnapshot,
+        ruleSetId: evalResult.ruleSet.id,
+        rulesSnapshot: evalResult.rulesSnapshot,
         originalData: originalRows,
         currentData: refinedRows,
         findings: aligned.findings,
@@ -275,7 +551,7 @@ router.post(
           sapMetadataUsed: sapMapping.sapMetadataUsed,
           autoFix: autoFixMeta,
         },
-        summary: lambdaResult.summary,
+        summary: evalResult.summary,
       });
 
       try {
@@ -298,8 +574,8 @@ router.post(
         sapMetadataUsed: sapMapping.sapMetadataUsed,
         detection,
         rulesBusinessObject,
-        ruleSet: lambdaResult.ruleSet,
-        summary: lambdaResult.summary,
+        ruleSet: evalResult.ruleSet,
+        summary: evalResult.summary,
         findings: aligned.findings,
         report: {
           ...aligned.report,
@@ -317,7 +593,7 @@ router.post(
           columnMapping,
           originalColumns,
         ),
-        evaluator: lambdaResult.evaluator || String(process.env.VALIDATION_LAMBDA_MODE || "local"),
+        evaluator,
         autoFix: {
           ok: true,
           ...autoFixMeta,

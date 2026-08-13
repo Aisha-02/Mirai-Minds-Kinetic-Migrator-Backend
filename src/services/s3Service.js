@@ -8,6 +8,8 @@
  * generated/rules/{sourceSchemaId}/{businessObject}.json
  * generated/reports/comparison/{batchId}/report.pdf
  * generated/validation/{sessionId}/refined.{ext}
+ * uploads/validation/{jobId}/{index}-{safeFilename}
+ * generated/validation/{jobId}/parsed/{filename}
  */
 
 import {
@@ -133,6 +135,11 @@ export function buildRefinedValidationKey({ sessionId, filename }) {
     ? filename.slice(filename.lastIndexOf("."))
     : ".xlsx";
   return `generated/validation/${sanitizePathSegment(sessionId)}/refined${ext}`;
+}
+
+export function buildValidationInputKey({ jobId, originalFilename, index = 0 }) {
+  const safeName = sanitizeFilename(originalFilename, `input-${index}`);
+  return `uploads/validation/${sanitizePathSegment(jobId)}/${index}-${safeName}`;
 }
 
 async function streamToBuffer(body) {

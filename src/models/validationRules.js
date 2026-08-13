@@ -99,3 +99,14 @@ export async function findLatestValidationRulesByBusinessObject(businessObject) 
   );
   return result.rows[0] ?? null;
 }
+
+/** Latest rule set for every business object that has saved rules. */
+export async function findLatestValidationRulesGrouped() {
+  const result = await query(
+    `SELECT DISTINCT ON (business_object)
+        id, business_object, rules, created_by, created_at, updated_at
+     FROM validation_rules
+     ORDER BY business_object, created_at DESC`,
+  );
+  return result.rows;
+}

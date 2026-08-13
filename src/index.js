@@ -60,4 +60,7 @@ app.listen(port, () => {
   console.log(
     `Comparison service: url=${process.env.COMPARISON_SERVICE_URL || "not set — using in-memory comparisonEngine"}`,
   );
+  console.log(
+    `Validation engine: url=${process.env.VALIDATION_ENGINE_URL || "MISSING"} internalKey=${process.env.INTERNAL_SERVICE_KEY ? "set" : "MISSING"}`,
+  );
 });

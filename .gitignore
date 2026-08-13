@@ -3,3 +3,12 @@ node_modules/
 .env.local
 .env.*.local
 uploads/
+
+# Python / validation-engine
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.e2e-tmp/
+.venv/
+venv/

@@ -7,3 +7,5 @@ __pycache__/
 .pytest_cache/
 comparison-engine.zip
 uploads/
+*.log
+.DS_Store

@@ -16,6 +16,7 @@ import { requestLogger } from "./middleware/requestLogger.js";
 
 const app = express();
 const port = Number(process.env.PORT) || 4000;
+const host = process.env.HOST || "0.0.0.0";
 
 if (!process.env.JWT_SECRET) {
   throw new Error("JWT_SECRET is required");
@@ -49,12 +50,18 @@ app.use((err, _req, res, _next) => {
   res.status(status).json({ error: message });
 });
 
-app.listen(port, () => {
-  console.log(`API listening on http://localhost:${port}`);
+app.listen(port, host, () => {
+  console.log(`API listening on http://${host}:${port}`);
   console.log(
     `SAP OData: baseUrl=${process.env.SAP_ODATA_BASE_URL ? "set" : "MISSING"} username=${process.env.SAP_ODATA_USERNAME ? "set" : "MISSING"} password=${process.env.SAP_ODATA_PASSWORD ? "set" : "MISSING"}`,
   );
   console.log(
-    `Groq: apiKey=${process.env.GROQ_API_KEY ? "set" : "MISSING"} provider=${process.env.AI_REPORT_PROVIDER || "groq"}`,
+    `AI: provider=${process.env.AI_REPORT_PROVIDER || "bedrock"} bedrockModel=${process.env.BEDROCK_MODEL_ID || "unset"} bedrockToken=${process.env.AWS_BEARER_TOKEN_BEDROCK ? "set" : "MISSING"}`,
+  );
+  console.log(
+    `Storage: mode=${process.env.FILE_STORAGE || "s3"} bucket=${process.env.S3_BUCKET || "mirai-minds-s3"}`,
+  );
+  console.log(
+    `Database: host=${process.env.RDSHOST || "unset"} auth=${process.env.DB_AUTH || "iam"}`,
   );
 });

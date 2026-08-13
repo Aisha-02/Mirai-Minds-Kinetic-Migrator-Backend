@@ -10,6 +10,10 @@ import { requireAuth, requireRole } from "../middleware/auth.js";
 import { detectBusinessObject } from "../services/businessObjectDetector.js";
 import { runValidationRulesLambda } from "../services/lambdaValidationRunner.js";
 import { SUPPORTED_BUSINESS_OBJECTS } from "../services/sapMetadataService.js";
+import {
+  isS3StorageEnabled,
+  uploadValidationArtifacts,
+} from "../services/s3StorageService.js";
 
 const router = Router();
 
@@ -144,6 +148,27 @@ router.post(
         rows,
       });
 
+      const reportPayload = {
+        ...lambdaResult.report,
+        filename: req.file.originalname,
+        totalRows: rows.length,
+        detection,
+        rulesBusinessObject,
+        summary: lambdaResult.summary,
+      };
+
+      let s3Artifacts = null;
+      if (isS3StorageEnabled()) {
+        const sessionKey = `${Date.now()}-${rulesBusinessObject}`;
+        s3Artifacts = await uploadValidationArtifacts({
+          userId: req.user.id,
+          sessionKey,
+          originalFilename: req.file.originalname,
+          fileBuffer: req.file.buffer,
+          reportJson: reportPayload,
+        });
+      }
+
       return res.status(200).json({
         filename: req.file.originalname,
         rowCount: rows.length,
@@ -153,13 +178,17 @@ router.post(
         ruleSet: lambdaResult.ruleSet,
         summary: lambdaResult.summary,
         findings: lambdaResult.findings,
-        report: {
-          ...lambdaResult.report,
-          filename: req.file.originalname,
-          totalRows: rows.length,
-        },
+        report: reportPayload,
         previewRows: lambdaResult.previewRows || rows.slice(0, 20),
         evaluator: String(process.env.VALIDATION_LAMBDA_MODE || "local"),
+        ...(s3Artifacts
+          ? {
+              storage: {
+                input: s3Artifacts.input.uri,
+                validation_report: s3Artifacts.report.uri,
+              },
+            }
+          : {}),
       });
     } catch (err) {
       return next(err);

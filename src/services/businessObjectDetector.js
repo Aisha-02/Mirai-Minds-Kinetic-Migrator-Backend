@@ -1,4 +1,5 @@
 import { SUPPORTED_BUSINESS_OBJECTS } from "./sapMetadataService.js";
+import { converseText } from "./bedrockChatService.js";
 
 const GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions";
 const DEFAULT_MODEL = "llama-3.3-70b-versatile";
@@ -81,6 +82,96 @@ function normalizeBusinessObjectLabel(value) {
     .replace(/\s+/g, "_");
 }
 
+function resolveDetectionProvider(explicit) {
+  const value = String(
+    explicit ||
+      process.env.AI_DETECTION_PROVIDER ||
+      process.env.AI_REPORT_PROVIDER ||
+      "bedrock",
+  )
+    .trim()
+    .toLowerCase();
+  return value === "groq" ? "groq" : "bedrock";
+}
+
+function parseDetectionFromModel(content, modelId) {
+  const parsed = extractJsonObject(content);
+  if (!parsed) {
+    return {
+      ok: false,
+      needsManualSelection: true,
+      error: {
+        code: "MALFORMED_RESPONSE",
+        message:
+          "Could not parse a JSON business-object classification from the model response",
+        details: String(content ?? "").slice(0, 300),
+      },
+    };
+  }
+
+  const businessObject = normalizeBusinessObjectLabel(parsed.businessObject);
+  const confidence = normalizeConfidence(parsed.confidence);
+  const reasoning = String(parsed.reasoning ?? "").trim();
+
+  if (!ALLOWED_LABELS.includes(businessObject)) {
+    return {
+      ok: false,
+      needsManualSelection: true,
+      businessObject: "NONE_MATCHED",
+      confidence: "low",
+      reasoning: reasoning || "Model returned an unsupported label",
+      error: {
+        code: "UNSUPPORTED_LABEL",
+        message: `Model returned unsupported business object '${parsed.businessObject}'`,
+      },
+    };
+  }
+
+  const needsManualSelection =
+    businessObject === "NONE_MATCHED" ||
+    !ACCEPTABLE_CONFIDENCE.has(confidence);
+
+  if (needsManualSelection) {
+    return {
+      ok: false,
+      needsManualSelection: true,
+      businessObject,
+      confidence,
+      reasoning,
+      message:
+        "Couldn't auto-detect — please select the business object manually",
+      candidates: [...SUPPORTED_BUSINESS_OBJECTS],
+    };
+  }
+
+  return {
+    ok: true,
+    needsManualSelection: false,
+    businessObject,
+    confidence,
+    reasoning,
+    modelId,
+  };
+}
+
+async function detectWithBedrock(input, options = {}) {
+  const prompt = buildDetectionPrompt(input);
+  const result = await converseText(prompt, options);
+
+  if (!result.ok) {
+    return {
+      ok: false,
+      needsManualSelection: true,
+      error: result.error,
+      candidates: [...SUPPORTED_BUSINESS_OBJECTS],
+      message:
+        "Couldn't auto-detect — please select the business object manually",
+    };
+  }
+
+  return parseDetectionFromModel(result.text, result.modelId);
+}
+
 /**
  * @param {{ columns: string[], sampleRows?: Record<string, unknown>[] }} input
  * @param {{
@@ -88,6 +179,7 @@ function normalizeBusinessObjectLabel(value) {
  *   modelId?: string,
  *   timeoutMs?: number,
  *   fetchImpl?: typeof fetch,
+ *   provider?: 'groq' | 'bedrock',
  * }} [options]
  */
 export async function detectBusinessObject(input, options = {}) {
@@ -107,6 +199,11 @@ export async function detectBusinessObject(input, options = {}) {
         message: "No column headers available for business object detection",
       },
     };
+  }
+
+  const provider = resolveDetectionProvider(options.provider);
+  if (provider === "bedrock") {
+    return detectWithBedrock({ columns, sampleRows }, options);
   }
 
   const apiKey = (options.apiKey || process.env.GROQ_API_KEY || "").trim();
@@ -180,63 +277,7 @@ export async function detectBusinessObject(input, options = {}) {
     }
 
     const content = payload?.choices?.[0]?.message?.content;
-    const parsed = extractJsonObject(content);
-    if (!parsed) {
-      return {
-        ok: false,
-        needsManualSelection: true,
-        error: {
-          code: "MALFORMED_RESPONSE",
-          message:
-            "Could not parse a JSON business-object classification from the model response",
-          details: String(content ?? "").slice(0, 300),
-        },
-      };
-    }
-
-    const businessObject = normalizeBusinessObjectLabel(parsed.businessObject);
-    const confidence = normalizeConfidence(parsed.confidence);
-    const reasoning = String(parsed.reasoning ?? "").trim();
-
-    if (!ALLOWED_LABELS.includes(businessObject)) {
-      return {
-        ok: false,
-        needsManualSelection: true,
-        businessObject: "NONE_MATCHED",
-        confidence: "low",
-        reasoning: reasoning || "Model returned an unsupported label",
-        error: {
-          code: "UNSUPPORTED_LABEL",
-          message: `Model returned unsupported business object '${parsed.businessObject}'`,
-        },
-      };
-    }
-
-    const needsManualSelection =
-      businessObject === "NONE_MATCHED" ||
-      !ACCEPTABLE_CONFIDENCE.has(confidence);
-
-    if (needsManualSelection) {
-      return {
-        ok: false,
-        needsManualSelection: true,
-        businessObject,
-        confidence,
-        reasoning,
-        message:
-          "Couldn't auto-detect — please select the business object manually",
-        candidates: [...SUPPORTED_BUSINESS_OBJECTS],
-      };
-    }
-
-    return {
-      ok: true,
-      needsManualSelection: false,
-      businessObject,
-      confidence,
-      reasoning,
-      modelId,
-    };
+    return parseDetectionFromModel(content, modelId);
   } catch (err) {
     const message = err?.message || "Business object detection failed";
     const lower = String(message).toLowerCase();

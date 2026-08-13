@@ -18,7 +18,37 @@ export function getSslConfig() {
   return undefined;
 }
 
+export function useRdsPasswordAuth() {
+  return (
+    Boolean(process.env.RDSHOST) &&
+    process.env.DB_AUTH === "password" &&
+    Boolean(process.env.RDSPASSWORD || process.env.DATABASE_URL)
+  );
+}
+
 export async function createPgConfig() {
+  if (useRdsPasswordAuth()) {
+    const hostname = process.env.RDSHOST;
+    const port = Number(process.env.RDSPORT || 5432);
+    const username = process.env.RDSUSER || "postgres";
+
+    if (process.env.DATABASE_URL) {
+      return {
+        connectionString: process.env.DATABASE_URL,
+        ssl: getSslConfig(),
+      };
+    }
+
+    return {
+      host: hostname,
+      port,
+      user: username,
+      password: process.env.RDSPASSWORD,
+      database: process.env.RDSDATABASE || "postgres",
+      ssl: getSslConfig(),
+    };
+  }
+
   if (useRdsIamAuth()) {
     const hostname = process.env.RDSHOST;
     const port = Number(process.env.RDSPORT || 5432);
@@ -48,8 +78,18 @@ export async function createPgConfig() {
   }
 
   if (!process.env.DATABASE_URL) {
+    if (!process.env.RDSHOST) {
+      throw new Error(
+        "RDSHOST is missing. Create a .env file in the project root (same folder as package.json) before running migrations.",
+      );
+    }
+    if (process.env.DB_AUTH === "password" && !process.env.RDSPASSWORD) {
+      throw new Error(
+        "RDSPASSWORD is required when DB_AUTH=password. Set it in .env or use DATABASE_URL instead.",
+      );
+    }
     throw new Error(
-      "Set RDSHOST (+ AWS_REGION) for RDS IAM auth, or DATABASE_URL for password auth",
+      "Database config incomplete. Set RDSHOST + RDSPASSWORD (DB_AUTH=password), or RDSHOST + AWS_REGION (DB_AUTH=iam), or DATABASE_URL.",
     );
   }
 

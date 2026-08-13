@@ -13,6 +13,7 @@
   "dependencies": {
     "@aws-sdk/client-bedrock-runtime": "^3.1108.0",
     "@aws-sdk/client-lambda": "^3.1109.0",
+    "@aws-sdk/client-s3": "^3.1109.0",
     "@aws-sdk/rds-signer": "^3.1108.0",
     "bcryptjs": "^3.0.2",
     "cors": "^2.8.5",

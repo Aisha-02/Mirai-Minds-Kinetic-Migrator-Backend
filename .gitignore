@@ -1,0 +1,9 @@
+node_modules/
+.env
+src/.env
+services/comparison-engine/.env
+__pycache__/
+*.pyc
+.pytest_cache/
+comparison-engine.zip
+uploads/

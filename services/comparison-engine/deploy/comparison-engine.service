@@ -1,0 +1,36 @@
+# Optional: systemd unit when running the container via Docker on EC2.
+# Install:
+#   sudo cp deploy/comparison-engine.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now comparison-engine
+#
+# Requires /opt/comparison-engine/.env with production values.
+
+[Unit]
+Description=Comparison Engine (Docker)
+Documentation=file:///opt/comparison-engine/README.md
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/comparison-engine
+EnvironmentFile=/opt/comparison-engine/.env
+# Set the image URI pulled from ECR (example below).
+Environment=COMPARISON_ENGINE_IMAGE=123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/comparison-engine:latest
+ExecStartPre=-/usr/bin/docker stop comparison-engine
+ExecStartPre=-/usr/bin/docker rm comparison-engine
+ExecStart=/usr/bin/docker run \
+  --name comparison-engine \
+  --restart unless-stopped \
+  --env-file /opt/comparison-engine/.env \
+  -p 8080:8080 \
+  -v comparison-engine-downloads:/tmp/comparison-engine \
+  ${COMPARISON_ENGINE_IMAGE}
+ExecStop=/usr/bin/docker stop comparison-engine
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

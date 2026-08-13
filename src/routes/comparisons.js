@@ -25,7 +25,7 @@ import {
   markReportProcessing,
   toPublicReport,
 } from "../models/comparisonReport.js";
-import { compareDatasets } from "../services/comparisonEngine.js";
+import { runComparison } from "../services/comparisonRunner.js";
 import { generateComparisonReport } from "../services/aiReportService.js";
 import { buildComparisonReportPdf } from "../services/pdfReportService.js";
 import { detectBusinessObject } from "../services/businessObjectDetector.js";
@@ -546,17 +546,28 @@ router.post(
       }
       reportId = report.id;
 
-      const preloadRows = Array.isArray(preload.parsed_data)
-        ? preload.parsed_data
-        : [];
-      const postloadRows = Array.isArray(postload.parsed_data)
-        ? postload.parsed_data
-        : [];
+      let comparisonResult;
+      try {
+        comparisonResult = await runComparison({
+          batchId,
+          preload,
+          postload,
+          identifierColumns,
+          compareColumns,
+        });
+      } catch (err) {
+        const failed = await failReport(db, {
+          reportId,
+          errorMessage:
+            err?.message || "Comparison failed before report generation",
+        });
+        return res.status(err?.status === 504 ? 504 : 502).json({
+          error: failed.error_message || "Comparison failed",
+          report: toPublicReport(failed),
+        });
+      }
 
-      const summary = compareDatasets(preloadRows, postloadRows, {
-        identifierColumns,
-        ...(compareColumns ? { compareColumns } : {}),
-      });
+      const summary = comparisonResult.summary;
 
       const aiResult = await generateComparisonReport(summary);
 
@@ -586,6 +597,10 @@ router.post(
         report: toPublicReport(completed),
         provider: aiResult.provider,
         model_id: aiResult.modelId,
+        comparison_evaluator: comparisonResult.evaluator,
+        ...(comparisonResult.fallbackReason
+          ? { comparison_fallback_reason: comparisonResult.fallbackReason }
+          : {}),
       });
     } catch (err) {
       if (reportId) {

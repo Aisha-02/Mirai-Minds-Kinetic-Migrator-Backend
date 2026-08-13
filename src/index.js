@@ -1,6 +1,13 @@
-import "dotenv/config";
+import dotenv from "dotenv";
+import path from "path";
+import { fileURLToPath } from "url";
 import cors from "cors";
 import express from "express";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// Standard: repo-root .env. Fallback: src/.env (common when editing next to the app).
+dotenv.config({ path: path.resolve(__dirname, "..", ".env") });
+dotenv.config({ path: path.resolve(__dirname, ".env") });
 import authRoutes from "./routes/auth.js";
 import comparisonRoutes from "./routes/comparisons.js";
 import rulesRoutes from "./routes/rules.js";

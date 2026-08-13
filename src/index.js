@@ -57,4 +57,7 @@ app.listen(port, () => {
   console.log(
     `S3: bucket=${process.env.AWS_S3_BUCKET || "MISSING — file uploads will fail"}`,
   );
+  console.log(
+    `Validation engine: url=${process.env.VALIDATION_ENGINE_URL || "MISSING"} internalKey=${process.env.INTERNAL_SERVICE_KEY ? "set" : "MISSING"}`,
+  );
 });

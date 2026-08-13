@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kinetic-validation-engine"
+version = "0.1.0"
+description = "FastAPI pandas validation engine for Kinetic Migrator preload files"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.32",
+  "pandas>=2.2",
+  "python-calamine>=0.3.0",
+  "openpyxl>=3.1",
+  "boto3>=1.34",
+  "pydantic>=2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "httpx>=0.27"]
+
+[tool.setuptools.packages.find]
+include = ["validation_engine*", "app*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

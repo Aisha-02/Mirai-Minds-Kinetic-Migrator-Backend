@@ -1,7 +1,6 @@
 import { SUPPORTED_BUSINESS_OBJECTS } from "./sapMetadataService.js";
+import { converseText, mapBedrockError } from "./bedrockClient.js";
 
-const GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions";
-const DEFAULT_MODEL = "llama-3.3-70b-versatile";
 const DEFAULT_TIMEOUT_MS = 45_000;
 const DEFAULT_SAMPLE_ROWS = 5;
 
@@ -84,10 +83,8 @@ function normalizeBusinessObjectLabel(value) {
 /**
  * @param {{ columns: string[], sampleRows?: Record<string, unknown>[] }} input
  * @param {{
- *   apiKey?: string,
  *   modelId?: string,
  *   timeoutMs?: number,
- *   fetchImpl?: typeof fetch,
  * }} [options]
  */
 export async function detectBusinessObject(input, options = {}) {
@@ -109,78 +106,20 @@ export async function detectBusinessObject(input, options = {}) {
     };
   }
 
-  const apiKey = (options.apiKey || process.env.GROQ_API_KEY || "").trim();
-  const modelId =
-    options.modelId || process.env.GROQ_MODEL_ID || DEFAULT_MODEL;
   const timeoutMs = Number(
-    options.timeoutMs ?? process.env.GROQ_TIMEOUT_MS ?? DEFAULT_TIMEOUT_MS,
+    options.timeoutMs ?? process.env.BEDROCK_TIMEOUT_MS ?? DEFAULT_TIMEOUT_MS,
   );
-  const fetchImpl = options.fetchImpl || fetch;
-
-  if (!apiKey) {
-    return {
-      ok: false,
-      needsManualSelection: true,
-      error: {
-        code: "CONFIG",
-        message: "GROQ_API_KEY is required for business object detection",
-      },
-    };
-  }
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const response = await fetchImpl(GROQ_CHAT_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: modelId,
-        temperature: 0,
-        max_tokens: 400,
-        messages: [
-          {
-            role: "user",
-            content: buildDetectionPrompt({ columns, sampleRows }),
-          },
-        ],
-      }),
-      signal: controller.signal,
+    const { text, modelId } = await converseText({
+      userText: buildDetectionPrompt({ columns, sampleRows }),
+      temperature: 0,
+      maxTokens: 400,
+      modelId: options.modelId,
+      timeoutMs,
     });
 
-    const bodyText = await response.text();
-    if (!response.ok) {
-      return {
-        ok: false,
-        needsManualSelection: true,
-        error: {
-          code: response.status === 429 ? "THROTTLED" : "GROQ_ERROR",
-          message: `Business object detection failed (HTTP ${response.status})`,
-          details: bodyText.slice(0, 300),
-        },
-      };
-    }
-
-    let payload;
-    try {
-      payload = JSON.parse(bodyText);
-    } catch {
-      return {
-        ok: false,
-        needsManualSelection: true,
-        error: {
-          code: "MALFORMED_RESPONSE",
-          message: "Groq returned a non-JSON envelope for detection",
-        },
-      };
-    }
-
-    const content = payload?.choices?.[0]?.message?.content;
-    const parsed = extractJsonObject(content);
+    const parsed = extractJsonObject(text);
     if (!parsed) {
       return {
         ok: false,
@@ -189,7 +128,7 @@ export async function detectBusinessObject(input, options = {}) {
           code: "MALFORMED_RESPONSE",
           message:
             "Could not parse a JSON business-object classification from the model response",
-          details: String(content ?? "").slice(0, 300),
+          details: String(text ?? "").slice(0, 300),
         },
       };
     }
@@ -238,28 +177,24 @@ export async function detectBusinessObject(input, options = {}) {
       modelId,
     };
   } catch (err) {
-    const message = err?.message || "Business object detection failed";
-    const lower = String(message).toLowerCase();
-    const timedOut =
-      err?.name === "AbortError" ||
-      lower.includes("timeout") ||
-      lower.includes("aborted");
+    const mapped = err?.code ? err : mapBedrockError(err);
+    const code = mapped.code || "BEDROCK_ERROR";
+    const message = mapped.message || err?.message || "Business object detection failed";
+    const timedOut = code === "TIMEOUT";
 
     return {
       ok: false,
       needsManualSelection: true,
       error: {
-        code: timedOut ? "TIMEOUT" : "NETWORK",
+        code: timedOut ? "TIMEOUT" : code === "THROTTLED" ? "THROTTLED" : code,
         message: timedOut
           ? "Business object detection timed out"
-          : "Business object detection request failed",
-        details: message,
+          : message,
+        details: mapped.details || err?.details,
       },
       candidates: [...SUPPORTED_BUSINESS_OBJECTS],
       message:
         "Couldn't auto-detect — please select the business object manually",
     };
-  } finally {
-    clearTimeout(timer);
   }
 }

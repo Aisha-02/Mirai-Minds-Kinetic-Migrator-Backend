@@ -4,6 +4,7 @@
  */
 
 import crypto from "crypto";
+import { resolveFieldColumn } from "../constants/fieldColumnAliases.js";
 
 function normalizeKey(value) {
   return String(value ?? "")
@@ -18,6 +19,8 @@ function ruleText(rule) {
     rule?.description,
     rule?.constraint,
     rule?.category,
+    rule?.type,
+    rule?.ruleId,
   ]
     .filter(Boolean)
     .join(" ")
@@ -36,17 +39,42 @@ function toNumber(value) {
 }
 
 function resolveColumn(fieldName, rows) {
-  const target = normalizeKey(fieldName);
   if (!rows.length) return null;
   const columns = Object.keys(rows[0] || {});
-  for (const col of columns) {
-    if (normalizeKey(col) === target) return col;
+  return resolveFieldColumn(fieldName, columns);
+}
+
+function isEmpty(value) {
+  return value == null || String(value).trim() === "";
+}
+
+function normalizeDatsValue(value) {
+  if (isEmpty(value)) return value;
+  const raw = String(value).trim();
+
+  if (/^\d{8}$/.test(raw.replace(/\s/g, ""))) {
+    return raw.replace(/\s/g, "");
   }
-  for (const col of columns) {
-    const n = normalizeKey(col);
-    if (n.includes(target) || target.includes(n)) return col;
+
+  const iso = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (iso) {
+    return `${iso[1]}${iso[2]}${iso[3]}`;
   }
-  return null;
+
+  const dmy = raw.match(/^(\d{2})-(\d{2})-(\d{4})$/);
+  if (dmy) {
+    return `${dmy[3]}${dmy[2]}${dmy[1]}`;
+  }
+
+  const mdy = raw.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (mdy) {
+    return `${mdy[3]}${mdy[1]}${mdy[2]}`;
+  }
+
+  const digits = raw.replace(/\D/g, "");
+  if (digits.length === 8) return digits;
+  if (digits.length === 7) return digits.padStart(8, "0");
+  return raw;
 }
 
 /**
@@ -54,8 +82,47 @@ function resolveColumn(fieldName, rows) {
  * @returns {{ type: string, params?: object, label: string } | null}
  */
 export function inferTransformFromRule(finding) {
-  const text = ruleText(finding?.rule || finding);
-  const lengthMatch = text.match(/(\d+)\s*characters?\s*or\s*less/);
+  const rule = finding?.rule || finding;
+  const text = ruleText(rule);
+  const lengthMatch = text.match(/(\d+)\s*characters?\s*(?:or\s*less|long)/);
+  const maxLengthMatch = text.match(/max(?:imum)?\s*length\s*(\d+)/i);
+
+  if (
+    text.includes("duplicate") ||
+    rule?.ruleId === "COMMON-DUPLICATE" ||
+    rule?.constraint === "UNIQUE_REQUIRED"
+  ) {
+    return {
+      type: "remove_duplicate_rows",
+      label: "Remove duplicate rows (keep first occurrence per key value)",
+    };
+  }
+
+  if (
+    text.includes("dats") ||
+    rule?.ruleId === "COMMON-DATS-FORMAT" ||
+    rule?.constraint === "SAP_DATS_YYYYMMDD" ||
+    (text.includes("yyyymmdd") && text.includes("date"))
+  ) {
+    return {
+      type: "normalize_dats",
+      label: "Normalize date to SAP DATS format (YYYYMMDD)",
+    };
+  }
+
+  if (text.includes("trim") || rule?.ruleId === "COMMON-TRIM") {
+    return {
+      type: "trim_whitespace",
+      label: "Trim leading and trailing whitespace",
+    };
+  }
+
+  if (text.includes("uppercase") || text.includes("upper case")) {
+    return {
+      type: "to_uppercase",
+      label: "Convert value to uppercase (per format rule)",
+    };
+  }
 
   if (text.includes("leading zero")) {
     return {
@@ -64,10 +131,24 @@ export function inferTransformFromRule(finding) {
     };
   }
 
+  if (
+    rule?.ruleId === "COMMON-FIELD-LENGTH" ||
+    rule?.constraint?.startsWith("MAX_LENGTH_")
+  ) {
+    const max =
+      Number(rule?.maxLength) ||
+      Number(String(rule?.constraint || "").match(/(\d+)/)?.[1]);
+    if (max) {
+      return {
+        type: "fit_length",
+        params: { max },
+        label: `Fit to max length ${max} (pad with leading zeros if shorter; trim if longer)`,
+      };
+    }
+  }
+
   if (lengthMatch) {
     const max = Number(lengthMatch[1]);
-    // SAP material numbers are commonly left zero-padded to fixed width.
-    // If value is too long, keep the rightmost max characters (numeric-pad style).
     return {
       type: "fit_length",
       params: { max },
@@ -75,10 +156,20 @@ export function inferTransformFromRule(finding) {
     };
   }
 
+  if (maxLengthMatch) {
+    const max = Number(maxLengthMatch[1]);
+    return {
+      type: "fit_length",
+      params: { max },
+      label: `Fit to max length ${max}`,
+    };
+  }
+
   if (
     text.includes("greater than or equal to zero") ||
     text.includes("greater than or equal to 0") ||
-    (text.includes("range") && text.includes("zero"))
+    (text.includes("range") && text.includes("zero")) ||
+    text.includes("non-negative")
   ) {
     return {
       type: "clamp_min_zero",
@@ -92,7 +183,7 @@ export function inferTransformFromRule(finding) {
   ) {
     return {
       type: "gross_gte_net",
-      params: { netFieldHints: ["NET_WEIGHT", "NET WEIGHT", "NETWT"] },
+      params: { netFieldHints: ["NET_WEIGHT", "NET WEIGHT", "NETWT", "NTGEW"] },
       label: "Raise gross weight to at least net weight (per consistency rule)",
     };
   }
@@ -107,13 +198,36 @@ export function inferTransformFromRule(finding) {
     };
   }
 
+  if (text.includes("decimal places") || text.includes("precision")) {
+    const precisionMatch = text.match(/(\d+)\s*decimal/);
+    if (precisionMatch) {
+      return {
+        type: "round_precision",
+        params: { decimals: Number(precisionMatch[1]) },
+        label: `Round to ${precisionMatch[1]} decimal places`,
+      };
+    }
+  }
+
   return null;
 }
 
-function applyValueTransform(type, params, value, row, columnIndexHints) {
+function applyValueTransform(type, params, value, row) {
   const empty = value == null || String(value).trim() === "";
 
   switch (type) {
+    case "normalize_dats": {
+      if (empty) return value;
+      return normalizeDatsValue(value);
+    }
+    case "trim_whitespace": {
+      if (empty) return value;
+      return String(value).trim();
+    }
+    case "to_uppercase": {
+      if (empty) return value;
+      return String(value).trim().toUpperCase();
+    }
     case "strip_leading_zeros": {
       if (empty) return value;
       const str = String(value).trim();
@@ -138,13 +252,23 @@ function applyValueTransform(type, params, value, row, columnIndexHints) {
       if (n == null) return value;
       return n < 0 ? 0 : n;
     }
+    case "round_precision": {
+      if (empty) return value;
+      const n = toNumber(value);
+      if (n == null) return value;
+      const decimals = Number(params?.decimals) || 2;
+      return Number(n.toFixed(decimals));
+    }
     case "gross_gte_net": {
       const hints = params?.netFieldHints || ["NET_WEIGHT"];
       let netCol = null;
       for (const hint of hints) {
         const target = normalizeKey(hint);
         for (const col of Object.keys(row || {})) {
-          if (normalizeKey(col) === target || normalizeKey(col).includes(target)) {
+          if (
+            normalizeKey(col) === target ||
+            normalizeKey(col).includes(target)
+          ) {
             netCol = col;
             break;
           }
@@ -165,6 +289,25 @@ function applyValueTransform(type, params, value, row, columnIndexHints) {
   }
 }
 
+function applyDuplicateRowFix(rows, column) {
+  const seen = new Set();
+  const result = [];
+
+  for (const row of rows) {
+    const raw = row?.[column];
+    if (isEmpty(raw)) {
+      result.push(row);
+      continue;
+    }
+    const key = String(raw).trim().toUpperCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(row);
+  }
+
+  return result;
+}
+
 /**
  * Build a preview proposal for a matched finding against current rows.
  */
@@ -179,8 +322,7 @@ export function buildFixProposal(finding, rows) {
   }
 
   const column =
-    finding.matchedColumn ||
-    resolveColumn(finding.fieldName, rows);
+    finding.matchedColumn || resolveColumn(finding.fieldName, rows);
 
   if (!column) {
     return {
@@ -189,9 +331,42 @@ export function buildFixProposal(finding, rows) {
     };
   }
 
+  if (transform.type === "remove_duplicate_rows") {
+    const beforeCount = rows.length;
+    const afterRows = applyDuplicateRowFix(rows, column);
+    if (afterRows.length === beforeCount) {
+      return {
+        ok: false,
+        error: "No duplicate rows would be removed for this field.",
+      };
+    }
+
+    return {
+      ok: true,
+      proposal: {
+        id: crypto.randomUUID(),
+        fieldName: finding.fieldName,
+        ruleName: finding.ruleName || finding.ruleViolated,
+        matchedColumn: column,
+        transform,
+        rule: finding.rule || null,
+        explanation: `Proposed fix for "${finding.ruleName || finding.ruleViolated}" on ${finding.fieldName}: ${transform.label}.`,
+        affectedCount: beforeCount - afterRows.length,
+        affectedRowIndexes: [],
+        diffSample: [],
+        rowLevel: false,
+        afterRows,
+      },
+    };
+  }
+
   const affectedRowIndexes = [];
   const diffSample = [];
   const data = Array.isArray(rows) ? rows : [];
+  const applyToAllRows =
+    transform.type === "normalize_dats" ||
+    transform.type === "trim_whitespace" ||
+    transform.type === "to_uppercase";
 
   for (let i = 0; i < data.length; i += 1) {
     const row = data[i];
@@ -201,15 +376,14 @@ export function buildFixProposal(finding, rows) {
       transform.params,
       before,
       row,
-      null,
     );
 
     const changed =
       String(before ?? "") !== String(after ?? "") &&
       !(before == null && after == null);
 
-    // Only include rows that the finding flagged, when available
     const flagged =
+      applyToAllRows ||
       !Array.isArray(finding.affectedRows) ||
       finding.affectedRows.length === 0 ||
       finding.affectedRows.includes(i + 1);
@@ -227,7 +401,7 @@ export function buildFixProposal(finding, rows) {
     }
   }
 
-  if (affectedRowIndexes.length === 0) {
+  if (affectedRowIndexes.length === 0 && !applyToAllRows) {
     return {
       ok: false,
       error:
@@ -245,14 +419,21 @@ export function buildFixProposal(finding, rows) {
       transform,
       rule: finding.rule || null,
       explanation: `Proposed fix for "${finding.ruleName || finding.ruleViolated}" on ${finding.fieldName} using the stored validation rule only: ${transform.label}.`,
-      affectedCount: affectedRowIndexes.length,
-      affectedRowIndexes,
+      affectedCount: applyToAllRows ? data.length : affectedRowIndexes.length,
+      affectedRowIndexes: applyToAllRows
+        ? data.map((_, idx) => idx)
+        : affectedRowIndexes,
       diffSample,
+      rowLevel: true,
     },
   };
 }
 
 export function applyProposalToRows(rows, proposal) {
+  if (proposal.afterRows) {
+    return proposal.afterRows.map((row) => ({ ...row }));
+  }
+
   const data = (Array.isArray(rows) ? rows : []).map((row) => ({ ...row }));
   const column = proposal.matchedColumn;
   const indexes = proposal.affectedRowIndexes || [];
@@ -261,16 +442,53 @@ export function applyProposalToRows(rows, proposal) {
   for (const idx of indexes) {
     if (idx < 0 || idx >= data.length) continue;
     const before = data[idx][column];
-    data[idx][column] = applyValueTransform(
-      type,
-      params,
-      before,
-      data[idx],
-      null,
-    );
+    data[idx][column] = applyValueTransform(type, params, before, data[idx]);
   }
 
   return data;
+}
+
+/**
+ * Apply deterministic fixes for every finding (errors first, then warnings).
+ */
+export function applyAllFindings(rows, findings) {
+  let data = (Array.isArray(rows) ? rows : []).map((row) => ({ ...row }));
+  const list = Array.isArray(findings) ? [...findings] : [];
+  list.sort((a, b) => {
+    const aErr = String(a.severity || "").toLowerCase() === "error" ? 0 : 1;
+    const bErr = String(b.severity || "").toLowerCase() === "error" ? 0 : 1;
+    return aErr - bErr;
+  });
+
+  const applied = [];
+  const skipped = [];
+  const seen = new Set();
+
+  for (const finding of list) {
+    const dedupeKey = `${finding.fieldName}::${finding.ruleName || finding.ruleViolated}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+
+    const result = buildFixProposal(finding, data);
+    if (!result.ok) {
+      skipped.push({
+        fieldName: finding.fieldName,
+        ruleName: finding.ruleName || finding.ruleViolated,
+        reason: result.error,
+      });
+      continue;
+    }
+
+    data = applyProposalToRows(data, result.proposal);
+    applied.push({
+      fieldName: finding.fieldName,
+      ruleName: finding.ruleName || finding.ruleViolated,
+      transform: result.proposal.transform?.type,
+      affectedCount: result.proposal.affectedCount,
+    });
+  }
+
+  return { rows: data, applied, skipped };
 }
 
 /**
@@ -287,7 +505,9 @@ export function matchFindingFromMessage(message, findings) {
   for (const finding of list) {
     let score = 0;
     const field = String(finding.fieldName || "").toLowerCase();
-    const rule = String(finding.ruleName || finding.ruleViolated || "").toLowerCase();
+    const rule = String(
+      finding.ruleName || finding.ruleViolated || "",
+    ).toLowerCase();
     const issue = String(finding.issue || "").toLowerCase();
 
     if (field && text.includes(field.toLowerCase())) score += 5;
@@ -296,15 +516,27 @@ export function matchFindingFromMessage(message, findings) {
       if (text.includes(token)) score += 2;
     }
     if (rule && text.includes(rule)) score += 4;
-    if (text.includes("length") && (issue.includes("length") || rule.includes("length") || String(finding.rule?.constraint || "").includes("characters"))) {
+    if (
+      text.includes("length") &&
+      (issue.includes("length") ||
+        rule.includes("length") ||
+        String(finding.rule?.constraint || "").includes("characters"))
+    ) {
       score += 3;
     }
-    if (text.includes("leading") && (issue.includes("leading") || rule.includes("leading"))) {
+    if (
+      text.includes("leading") &&
+      (issue.includes("leading") || rule.includes("leading"))
+    ) {
       score += 3;
     }
     if (text.includes("weight") && field.includes("weight")) score += 2;
     if (text.includes("gross") && field.includes("gross")) score += 3;
-    if (text.includes("fix") || text.includes("correct") || text.includes("repair")) {
+    if (
+      text.includes("fix") ||
+      text.includes("correct") ||
+      text.includes("repair")
+    ) {
       score += 1;
     }
 

@@ -10,6 +10,7 @@ import {
   COMMON_RULE_IDS,
   RULE_SOURCE,
 } from "./commonRules.js";
+import { resolveFieldColumn } from "../constants/fieldColumnAliases.js";
 
 const MAX_AFFECTED_ROWS_SAMPLE = 25;
 const MAX_SAMPLE_VALUES = 8;
@@ -52,16 +53,7 @@ function buildColumnIndex(rows) {
 }
 
 function resolveColumn(fieldName, columnIndex) {
-  const exact = columnIndex.byNorm.get(normalizeKey(fieldName));
-  if (exact) return exact;
-
-  const target = normalizeKey(fieldName);
-  for (const [norm, col] of columnIndex.byNorm) {
-    if (norm.includes(target) || target.includes(norm)) {
-      return col;
-    }
-  }
-  return null;
+  return resolveFieldColumn(fieldName, columnIndex.columns);
 }
 
 function ruleText(rule) {

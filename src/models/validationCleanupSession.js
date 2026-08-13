@@ -115,6 +115,9 @@ export function toPublicCleanupSession(session) {
     summary: session.summary,
     pendingProposal: session.pending_proposal,
     chatMessages: session.chat_messages,
+    autoFix: session.report?.autoFix ?? null,
+    refinedFilename: session.report?.autoFix?.refinedFilename ?? null,
+    refinedReady: Boolean(session.report?.autoFix?.ready),
     rowCount: Array.isArray(session.current_data)
       ? session.current_data.length
       : 0,

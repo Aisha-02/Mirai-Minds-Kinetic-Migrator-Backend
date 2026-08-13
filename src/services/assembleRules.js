@@ -92,6 +92,12 @@ export function toPersistableAiRules(businessObject, rules) {
         return {
           fieldName: field.fieldName,
           key: persistKeyFlag(field),
+          dataType:
+            field.metadata?.dataType || field.dataType
+              ? String(field.metadata?.dataType || field.dataType).trim()
+              : "",
+          length:
+            field.metadata?.length ?? field.length ?? "",
           rules: aiOnly.map((rule) => ({
             ruleName: rule.ruleName,
             source: RULE_SOURCE.AI,

@@ -470,7 +470,7 @@ router.post(
 /**
  * Synchronous run: no job queue exists in this project.
  * Uploads are capped (~5MB), parsed data is already in DB, and AI generation
- * is bounded by GROQ/BEDROCK timeout — so we process inline and return the
+ * is bounded by Bedrock timeout — so we process inline and return the
  * final report (200 completed / 502 failed after persistence).
  */
 router.post(

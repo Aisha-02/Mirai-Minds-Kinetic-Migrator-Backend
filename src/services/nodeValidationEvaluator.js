@@ -3,8 +3,14 @@
  * Mirrors the Python Lambda contract (findings only — no transforms).
  */
 
+import { resolveFieldColumn } from "../constants/fieldColumnAliases.js";
 import { findLatestValidationRulesByBusinessObject } from "../models/validationRules.js";
 import { buildPredefinedRulesForField } from "./commonRules.js";
+import {
+  buildTypeRulesForField,
+  checkDateRelatedRule,
+  checkSapTypeRule,
+} from "./sapTypeValidation.js";
 
 const PREVIEW_ROW_LIMIT = 20;
 const AFFECTED_SAMPLE_LIMIT = 25;
@@ -50,13 +56,7 @@ function collectColumns(rows) {
 }
 
 function resolveColumn(fieldName, columns) {
-  const target = norm(fieldName);
-  const byNorm = new Map(columns.map((c) => [norm(c), c]));
-  if (byNorm.has(target)) return byNorm.get(target);
-  for (const [n, col] of byNorm) {
-    if (n.includes(target) || target.includes(n)) return col;
-  }
-  return null;
+  return resolveFieldColumn(fieldName, columns);
 }
 
 /** Primary key only when validation_rules field has key = "X". */
@@ -82,6 +82,8 @@ function mergeFields(fields) {
     byName.set(norm(name), {
       fieldName: name,
       key: fieldKeyFlag(field),
+      dataType: field?.dataType ?? field?.metadata?.dataType ?? "",
+      length: field?.length ?? field?.metadata?.length ?? "",
       rules: Array.isArray(field.rules) ? [...field.rules] : [],
     });
   }
@@ -115,7 +117,21 @@ function mergeFields(fields) {
       if (ids.has(pre.ruleId) || names.has(pre.ruleName.toLowerCase())) continue;
       rules.push(pre);
     }
-    return { fieldName: field.fieldName, key: field.key, rules };
+
+    for (const typeRule of buildTypeRulesForField(field)) {
+      if (ids.has(typeRule.ruleId) || names.has(typeRule.ruleName.toLowerCase())) {
+        continue;
+      }
+      rules.push(typeRule);
+    }
+
+    return {
+      fieldName: field.fieldName,
+      key: field.key,
+      dataType: field.dataType,
+      length: field.length,
+      rules,
+    };
   });
 }
 
@@ -149,12 +165,18 @@ function duplicateRows(rows, column) {
   return { affected, samples };
 }
 
-function checkValue(rule, value) {
+function checkValue(rule, value, field) {
   const text = ruleText(rule);
   const empty = isEmpty(value);
   const s = empty ? "" : String(value).trim();
 
   if (text.includes("duplicate")) return { violated: false };
+
+  const sapTypeResult = checkSapTypeRule(rule, value, field);
+  if (sapTypeResult) return sapTypeResult;
+
+  const dateResult = checkDateRelatedRule(rule, value);
+  if (dateResult) return dateResult;
 
   if (
     text.includes("null/empty") ||
@@ -252,7 +274,7 @@ function evaluate(rows, rulesPayload, businessObject) {
         const affectedRows = [];
         const samples = [];
         for (let i = 0; i < rows.length; i += 1) {
-          const result = checkValue(rule, rows[i]?.[column]);
+          const result = checkValue(rule, rows[i]?.[column], field);
           if (!result.violated) continue;
           const rowNum = i + 1;
           affectedRows.push(rowNum);

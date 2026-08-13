@@ -26,6 +26,34 @@ def _norm(value: Any) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(value or "").strip().upper())
 
 
+# Equivalent SAP / preload column names (mirrors src/constants/fieldColumnAliases.js)
+FIELD_EQUIVALENCE_GROUPS: list[list[str]] = [
+    ["MATERIALNUMBER", "MATNR"],
+    ["MATERIALTYPE", "MTART"],
+    ["MATERIALGROUP", "MATKL"],
+    ["MATERIALDESC", "MAKTX", "MATERIALDESCRIPTION"],
+    ["UOMCODE", "MEINS", "BASEUNITOFMEASURE"],
+    ["PLANTCODE", "WERKS", "PLANT"],
+    ["LANGUAGECODE", "SPRAS", "LANGUAGEKEY"],
+    ["GROSSWEIGHT", "BRGEW"],
+    ["NETWEIGHT", "NTGEW"],
+    ["WEIGHTUNIT", "GEWEI"],
+    ["PONUMBER", "EBELN", "PURCHASEORDER"],
+    ["POITEM", "EBELP", "ITEMNUMBER"],
+    ["VENDORNUMBER", "LIFNR", "VENDOR"],
+    ["PARTNERNUMBER", "PARTNER", "BPNUMBER", "KUNNR", "LIFNR"],
+    ["SALESORDERNUMBER", "VBELN", "SALESORDER"],
+    ["SALESORDERITEM", "POSNR", "ITEM"],
+    ["GLACCOUNT", "SAKNR", "GLACCOUNTNUMBER", "HKONT"],
+]
+
+_EQUIVALENCE_INDEX: dict[str, set[str]] = {}
+for _group in FIELD_EQUIVALENCE_GROUPS:
+    _norms = [_norm(name) for name in _group]
+    for _name in _norms:
+        _EQUIVALENCE_INDEX.setdefault(_name, set()).update(_norms)
+
+
 def _empty(value: Any) -> bool:
     return value is None or str(value).strip() == ""
 
@@ -53,12 +81,19 @@ def _rule_text(rule: dict) -> str:
 
 def _resolve_column(field_name: str, columns: list[str]) -> str | None:
     target = _norm(field_name)
+    if not target:
+        return None
     by_norm = {_norm(c): c for c in columns}
     if target in by_norm:
         return by_norm[target]
     for norm, col in by_norm.items():
         if target in norm or norm in target:
             return col
+    equivalents = _EQUIVALENCE_INDEX.get(target)
+    if equivalents:
+        for norm, col in by_norm.items():
+            if norm in equivalents:
+                return col
     return None
 
 
@@ -159,6 +194,203 @@ def _is_duplicate_rule(rule: dict) -> bool:
     )
 
 
+INFERRED_DATS_FIELDS = {
+    "BEDAT", "AEDAT", "BUDAT", "BLDAT", "EINDT", "DATUM", "ERDAT", "LAEDA",
+    "CPUDT", "BEGDA", "ENDDA", "GSTRP", "GLTRP", "FKDAT", "BILLDATE", "VALUT", "AUGDT",
+}
+
+
+def _resolve_field_data_type(field: dict) -> str:
+    explicit = _norm(field.get("dataType") or (field.get("metadata") or {}).get("dataType"))
+    if explicit:
+        return explicit
+    if str(field.get("fieldName") or "").strip().upper() in INFERRED_DATS_FIELDS:
+        return "DATS"
+    return ""
+
+
+def _resolve_field_length(field: dict) -> int | None:
+    raw = field.get("length")
+    if raw in ("", None) and isinstance(field.get("metadata"), dict):
+        raw = field["metadata"].get("length")
+    if raw in ("", None):
+        return None
+    try:
+        n = int(raw)
+        return n if n > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _type_rules_for_field(field: dict) -> list[dict]:
+    data_type = _resolve_field_data_type(field)
+    length = _resolve_field_length(field)
+    rules: list[dict] = []
+
+    if data_type == "DATS":
+        rules.append(
+            {
+                "ruleName": "SAP DATS Format Check",
+                "source": "PREDEFINED",
+                "ruleId": "COMMON-DATS-FORMAT",
+                "type": "validation",
+                "description": "Date must be in SAP DATS format YYYYMMDD (8 numeric digits, valid calendar date).",
+                "constraint": "SAP_DATS_YYYYMMDD",
+                "severity": "error",
+                "category": "format",
+            }
+        )
+
+    if data_type == "TIMS":
+        rules.append(
+            {
+                "ruleName": "SAP TIMS Format Check",
+                "source": "PREDEFINED",
+                "ruleId": "COMMON-TIMS-FORMAT",
+                "type": "validation",
+                "description": "Time must be in SAP TIMS format HHMMSS (6 numeric digits, valid time).",
+                "constraint": "SAP_TIMS_HHMMSS",
+                "severity": "error",
+                "category": "format",
+            }
+        )
+
+    if length is not None and data_type not in ("DATS", "TIMS"):
+        rules.append(
+            {
+                "ruleName": "Field Length Check",
+                "source": "PREDEFINED",
+                "ruleId": "COMMON-FIELD-LENGTH",
+                "type": "validation",
+                "description": f"Value must not exceed {length} characters for SAP type {data_type or 'CHAR'}.",
+                "constraint": f"MAX_LENGTH_{length}",
+                "severity": "warning",
+                "category": "format",
+                "maxLength": length,
+            }
+        )
+
+    return rules
+
+
+def _validate_sap_dats(value: Any) -> tuple[bool, str | None]:
+    if _empty(value):
+        return False, None
+    raw = str(value).strip()
+    if re.search(r"[-/.]", raw):
+        return True, f'Value "{raw}" is not in SAP DATS format (use YYYYMMDD, e.g. 20260801)'
+    digits = raw.replace(" ", "")
+    if not re.fullmatch(r"\d+", digits):
+        return True, f'Value "{raw}" must contain only digits for SAP DATS'
+    if len(digits) != 8:
+        return True, f'Value "{raw}" must be exactly 8 digits (YYYYMMDD); found {len(digits)}'
+    year, month, day = int(digits[:4]), int(digits[4:6]), int(digits[6:8])
+    try:
+        from datetime import date
+
+        date(year, month, day)
+    except ValueError:
+        return True, f'Value "{digits}" is not a valid calendar date'
+    return False, None
+
+
+def _parse_flexible_date(value: Any):
+    from datetime import date
+
+    raw = str(value).strip()
+    if not raw:
+        return None
+    violated, _ = _validate_sap_dats(raw)
+    if not violated:
+        digits = raw.replace(" ", "")
+        if re.fullmatch(r"\d{8}", digits):
+            return date(int(digits[:4]), int(digits[4:6]), int(digits[6:8]))
+
+    iso = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", raw)
+    if iso:
+        try:
+            return date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
+        except ValueError:
+            return None
+
+    dmy = re.fullmatch(r"(\d{2})-(\d{2})-(\d{4})", raw)
+    if dmy:
+        try:
+            return date(int(dmy.group(3)), int(dmy.group(2)), int(dmy.group(1)))
+        except ValueError:
+            return None
+
+    return None
+
+
+def _validate_date_not_in_future(value: Any) -> tuple[bool, str | None]:
+    if _empty(value):
+        return False, None
+    parsed = _parse_flexible_date(value)
+    if not parsed:
+        return True, f'Value "{str(value).strip()}" could not be parsed as a date'
+    from datetime import date
+
+    if parsed > date.today():
+        return True, f'Date {str(value).strip()} is in the future'
+    return False, None
+
+
+def _check_sap_type_rule(rule: dict, value: Any, field: dict) -> tuple[bool, str | None] | None:
+    rule_id = str(rule.get("ruleId") or "")
+    data_type = _resolve_field_data_type(field)
+
+    if (
+        rule_id == "COMMON-DATS-FORMAT"
+        or rule.get("constraint") == "SAP_DATS_YYYYMMDD"
+        or (data_type == "DATS" and "dats" in str(rule.get("ruleName") or "").lower())
+    ):
+        return _validate_sap_dats(value)
+
+    if rule_id == "COMMON-TIMS-FORMAT" or rule.get("constraint") == "SAP_TIMS_HHMMSS":
+        if _empty(value):
+            return False, None
+        raw = str(value).strip().replace(":", "")
+        if not re.fullmatch(r"\d{6}", raw):
+            return True, f'Value "{str(value).strip()}" must be 6 digits (HHMMSS) for SAP TIMS'
+        hours, minutes, seconds = int(raw[:2]), int(raw[2:4]), int(raw[4:6])
+        if hours > 23 or minutes > 59 or seconds > 59:
+            return True, f'Value "{raw}" is not a valid time (HHMMSS)'
+        return False, None
+
+    if rule_id == "COMMON-FIELD-LENGTH":
+        max_len = rule.get("maxLength")
+        if not max_len:
+            match = re.search(r"(\d+)", str(rule.get("constraint") or ""))
+            max_len = int(match.group(1)) if match else None
+        if not max_len or _empty(value):
+            return False, None
+        length = len(str(value).strip())
+        if length > int(max_len):
+            return True, f"Length {length} exceeds max {max_len} for field type {data_type or 'CHAR'}"
+        return False, None
+
+    return None
+
+
+def _check_date_related_rule(rule: dict, value: Any) -> tuple[bool, str | None] | None:
+    text = _rule_text(rule)
+    if (
+        "not in future" in text
+        or "not in the future" in text
+        or "future date" in text
+        or ("future" in text and "date" in text)
+    ):
+        return _validate_date_not_in_future(value)
+
+    if "yyyy-mm-dd" in text or "yyyymmdd" in text or (
+        "date" in text and "format" in text and "not in future" not in text
+    ):
+        return _validate_sap_dats(value)
+
+    return None
+
+
 def _extract_fields(rules_payload: dict) -> list[dict]:
     if not rules_payload:
         return []
@@ -184,6 +416,8 @@ def _merge_fields(fields: list[dict]) -> list[dict]:
         by_name[_norm(name)] = {
             "fieldName": name,
             "key": key_flag,
+            "dataType": field.get("dataType") or (field.get("metadata") or {}).get("dataType") or "",
+            "length": field.get("length") if field.get("length") not in (None, "") else (field.get("metadata") or {}).get("length", ""),
             "rules": stored_rules,
         }
 
@@ -197,7 +431,20 @@ def _merge_fields(fields: list[dict]) -> list[dict]:
             if rid in existing_ids or pre["ruleName"].lower() in existing_names:
                 continue
             rules.append(pre)
-        merged.append({"fieldName": field["fieldName"], "key": field["key"], "rules": rules})
+        for type_rule in _type_rules_for_field(field):
+            rid = type_rule.get("ruleId") or ""
+            if rid in existing_ids or type_rule["ruleName"].lower() in existing_names:
+                continue
+            rules.append(type_rule)
+        merged.append(
+            {
+                "fieldName": field["fieldName"],
+                "key": field["key"],
+                "dataType": field.get("dataType", ""),
+                "length": field.get("length", ""),
+                "rules": rules,
+            }
+        )
     return merged
 
 
@@ -229,13 +476,21 @@ def _duplicate_rows(rows: list[dict], column: str) -> tuple[list[int], list[dict
     return affected, samples
 
 
-def _check_value(rule: dict, value: Any) -> tuple[bool, str | None]:
+def _check_value(rule: dict, value: Any, field: dict | None = None) -> tuple[bool, str | None]:
     text = _rule_text(rule)
     empty = _empty(value)
     s = "" if empty else str(value).strip()
 
     if "duplicate" in text:
         return False, None
+
+    if field is not None:
+        sap_result = _check_sap_type_rule(rule, value, field)
+        if sap_result is not None:
+            return sap_result
+        date_result = _check_date_related_rule(rule, value)
+        if date_result is not None:
+            return date_result
 
     if (
         "null/empty" in text
@@ -329,7 +584,7 @@ def evaluate(rows: list[dict], rules_payload: dict, business_object: str) -> dic
                 affected_rows: list[int] = []
                 samples = []
                 for idx, row in enumerate(rows):
-                    violated, reason = _check_value(rule, row.get(column))
+                    violated, reason = _check_value(rule, row.get(column), field)
                     if not violated:
                         continue
                     row_num = idx + 1

@@ -5,6 +5,7 @@ import authRoutes from "./routes/auth.js";
 import comparisonRoutes from "./routes/comparisons.js";
 import rulesRoutes from "./routes/rules.js";
 import validationRoutes from "./routes/validation.js";
+import documentsRoutes from "./routes/documents.js";
 import { requestLogger } from "./middleware/requestLogger.js";
 
 const app = express();
@@ -31,6 +32,7 @@ app.use("/api/auth", authRoutes);
 app.use("/api/comparisons", comparisonRoutes);
 app.use("/api/rules", rulesRoutes);
 app.use("/api/validation", validationRoutes);
+app.use("/api/documents", documentsRoutes);
 
 app.use((err, _req, res, _next) => {
   console.error(err);
@@ -48,6 +50,6 @@ app.listen(port, () => {
     `SAP OData: baseUrl=${process.env.SAP_ODATA_BASE_URL ? "set" : "MISSING"} username=${process.env.SAP_ODATA_USERNAME ? "set" : "MISSING"} password=${process.env.SAP_ODATA_PASSWORD ? "set" : "MISSING"}`,
   );
   console.log(
-    `Groq: apiKey=${process.env.GROQ_API_KEY ? "set" : "MISSING"} provider=${process.env.AI_REPORT_PROVIDER || "groq"}`,
+    `Bedrock: region=${process.env.BEDROCK_REGION || process.env.AWS_REGION || "MISSING"} model=${process.env.BEDROCK_MODEL_ID || "MISSING"} credentials=${process.env.AWS_BEARER_TOKEN_BEDROCK || process.env.AWS_ACCESS_KEY_ID ? "set" : "MISSING"}`,
   );
 });

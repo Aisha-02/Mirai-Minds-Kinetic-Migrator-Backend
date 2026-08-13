@@ -126,3 +126,42 @@ export function buildStoragePath({ userId, batchId, fileType, originalFilename }
   const filename = `${fileType}-${Date.now()}-${safeBase}${ext}`;
   return path.join(UPLOADS_ROOT, String(userId), String(batchId), filename);
 }
+
+export function buildRefinedFilename(originalFilename) {
+  const ext = getFileExtension(originalFilename) || ".xlsx";
+  return `preload_refined${ext}`;
+}
+
+/**
+ * Serialize normalized row objects to CSV or XLSX buffer (matches upload format).
+ * @param {Record<string, unknown>[]} rows
+ * @param {string} originalFilename
+ * @returns {Buffer}
+ */
+export function serializeRowsToBuffer(rows, originalFilename) {
+  const ext = getFileExtension(originalFilename);
+  const data = Array.isArray(rows) ? rows : [];
+
+  if (ext === ".csv") {
+    if (!data.length) return Buffer.from("", "utf8");
+    const columns = Object.keys(data[0]);
+    const escape = (value) => {
+      if (value == null) return "";
+      const str = String(value);
+      if (/[",\n\r]/.test(str)) return `"${str.replace(/"/g, '""')}"`;
+      return str;
+    };
+    const lines = [
+      columns.join(","),
+      ...data.map((row) => columns.map((col) => escape(row[col])).join(",")),
+    ];
+    return Buffer.from(lines.join("\n"), "utf8");
+  }
+
+  const worksheet = XLSX.utils.json_to_sheet(data);
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, worksheet, "preload_refined");
+  return Buffer.from(
+    XLSX.write(workbook, { type: "buffer", bookType: "xlsx" }),
+  );
+}

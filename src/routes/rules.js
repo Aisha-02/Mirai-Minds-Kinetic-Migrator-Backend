@@ -12,7 +12,7 @@ import {
   toBusinessObjectJson,
 } from "../services/excelParser.js";
 import { validateFieldMetadata } from "../services/excelValidator.js";
-import { generateAiRulesWithGrok } from "../services/grokRules.js";
+import { generateAiRulesWithBedrock } from "../services/bedrockRules.js";
 import {
   assembleFieldRules,
   toPersistableAiRules,
@@ -72,7 +72,7 @@ router.post(
       validateFieldMetadata(fields);
 
       const sourceFields = toBusinessObjectJson(businessObject, fields);
-      const aiByField = await generateAiRulesWithGrok(
+      const aiByField = await generateAiRulesWithBedrock(
         businessObject,
         sourceFields,
         fields,
@@ -86,12 +86,12 @@ router.post(
         rules,
         persisted: false,
         message:
-          "Review predefined + AI rules. Save stores Business Object, field names, key flags (X = primary key), and AI rules.",
+          "Review predefined + AI rules. Save stores Business Object, field names, key flags (X = primary key), data types, lengths, and AI rules.",
       });
     } catch (err) {
       if (err?.status === 401 || err?.status === 403) {
         err.message =
-          err.message || "LLM access denied. Check GROK_API_KEY / model access.";
+          err.message || "LLM access denied. Check Bedrock credentials and model access.";
       }
       return next(err);
     }
@@ -134,7 +134,7 @@ router.post("/save", requireAuth, async (req, res, next) => {
     });
 
     return res.status(201).json({
-      message: "Saved Business Object + field names + key flags + AI rules",
+      message: "Saved Business Object + field names + key flags + data types + AI rules",
       ruleSet: saved,
     });
   } catch (err) {

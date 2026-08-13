@@ -8,6 +8,11 @@
  */
 
 import { XMLParser } from "fast-xml-parser";
+import {
+  buildPreloadToSapColumnMap,
+  remapRowsToSapColumns,
+  resolveSapNameForPreloadColumn,
+} from "../constants/fieldColumnAliases.js";
 
 export const SUPPORTED_BUSINESS_OBJECTS = Object.freeze([
   "MATERIAL_MASTER",
@@ -685,4 +690,85 @@ export async function getBusinessObjectMetadata(businessObject, options = {}) {
 /** Test helper — clears the in-memory metadata cache. */
 export function clearSapMetadataCache() {
   metadataCache.clear();
+}
+
+function buildAliasFallbackColumnMapping(preloadColumns) {
+  /** @type {Record<string, string>} */
+  const mapping = {};
+  for (const col of preloadColumns) {
+    mapping[col] = resolveSapNameForPreloadColumn(col, []);
+  }
+  return mapping;
+}
+
+/**
+ * Map descriptive preload column headers to canonical SAP field names
+ * using SAP OData metadata for the detected business object.
+ *
+ * @param {Record<string, unknown>[]} rows
+ * @param {string} businessObject SAP detector label (e.g. MATERIAL_MASTER)
+ * @param {object} [options]
+ * @returns {Promise<{
+ *   ok: boolean,
+ *   rows: Record<string, unknown>[],
+ *   originalColumns: string[],
+ *   sapColumns: string[],
+ *   columnMapping: Record<string, string>,
+ *   sapMetadataUsed: boolean,
+ *   sapFieldNames?: string[],
+ *   error?: string,
+ * }>}
+ */
+export async function mapPreloadToSapFields(rows, businessObject, options = {}) {
+  const data = Array.isArray(rows) ? rows : [];
+  const originalColumns = data.length > 0 ? Object.keys(data[0]) : [];
+  const normalizedBo = normalizeBusinessObject(businessObject);
+
+  if (!SUPPORTED_BUSINESS_OBJECTS.includes(normalizedBo)) {
+    const identity = Object.fromEntries(originalColumns.map((col) => [col, col]));
+    return {
+      ok: false,
+      rows: data,
+      originalColumns,
+      sapColumns: originalColumns,
+      columnMapping: identity,
+      sapMetadataUsed: false,
+      error: `Unsupported business object '${businessObject}' for SAP column mapping`,
+    };
+  }
+
+  const metadata = await getBusinessObjectMetadata(normalizedBo, options);
+  if (!metadata.ok || !metadata.fields?.length) {
+    const columnMapping = buildAliasFallbackColumnMapping(originalColumns);
+    const sapFieldNames = [...new Set(Object.values(columnMapping))];
+    const mappedRows = remapRowsToSapColumns(data, columnMapping, sapFieldNames);
+    const sapColumns =
+      mappedRows.length > 0 ? Object.keys(mappedRows[0]) : originalColumns;
+    return {
+      ok: true,
+      rows: mappedRows,
+      originalColumns,
+      sapColumns,
+      columnMapping,
+      sapMetadataUsed: false,
+      sapFieldNames,
+      error: metadata.error?.message || "SAP metadata unavailable",
+    };
+  }
+
+  const sapFieldNames = metadata.fields.map((field) => field.fieldName);
+  const columnMapping = buildPreloadToSapColumnMap(originalColumns, sapFieldNames);
+  const mappedRows = remapRowsToSapColumns(data, columnMapping, sapFieldNames);
+  const sapColumns =
+    mappedRows.length > 0 ? Object.keys(mappedRows[0]) : [...new Set(Object.values(columnMapping))];
+
+  return {
+    ok: true,
+    rows: mappedRows,
+    originalColumns,
+    sapColumns,
+    columnMapping,
+    sapMetadataUsed: true,
+    sapFieldNames,
+  };
 }

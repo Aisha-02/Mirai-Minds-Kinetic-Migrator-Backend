@@ -22,6 +22,10 @@ function normalizeEmail(email) {
     .toLowerCase();
 }
 
+function isAcceptedFlag(value) {
+  return value === true || value === "true" || value === 1 || value === "1";
+}
+
 function validateCredentials(email, password) {
   const errors = [];
 
@@ -53,12 +57,23 @@ router.post("/register", async (req, res, next) => {
   try {
     const email = normalizeEmail(req.body?.email);
     const password = req.body?.password;
+    const fullName = String(req.body?.fullName ?? req.body?.full_name ?? "").trim();
     const requestedRole = String(req.body?.role ?? "normal_user").trim();
     const role = ALLOWED_ROLES.has(requestedRole) ? requestedRole : null;
+
+    const termsAccepted = isAcceptedFlag(
+      req.body?.termsAccepted ??
+        req.body?.terms_accepted ??
+        req.body?.agreeToTerms ??
+        req.body?.acceptTerms,
+    );
 
     const errors = validateCredentials(email, password);
     if (!role) {
       errors.push('role must be "admin" or "normal_user"');
+    }
+    if (!termsAccepted) {
+      errors.push("You must accept the Terms and Conditions to register");
     }
     if (errors.length > 0) {
       return res.status(400).json({ error: errors.join("; ") });
@@ -70,7 +85,13 @@ router.post("/register", async (req, res, next) => {
     }
 
     const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
-    const user = await createUser({ email, passwordHash, role });
+    const user = await createUser({
+      email,
+      passwordHash,
+      role,
+      fullName: fullName || null,
+      termsAcceptedAt: new Date(),
+    });
 
     return res.status(201).json({ user: toPublicUser(user) });
   } catch (err) {

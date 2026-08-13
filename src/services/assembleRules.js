@@ -1,4 +1,18 @@
 import { buildPredefinedRulesForField, RULE_SOURCE } from "./commonRules.js";
+import { resolveFieldColumn } from "../constants/fieldColumnAliases.js";
+
+const PERSISTED_SOURCES = new Set([RULE_SOURCE.AI, RULE_SOURCE.CUSTOM]);
+
+export function normalizeRuleSource(value) {
+  const source = String(value || "").trim().toUpperCase();
+  if (source === RULE_SOURCE.PREDEFINED || source === "PREDEFINED") {
+    return RULE_SOURCE.PREDEFINED;
+  }
+  if (source === RULE_SOURCE.CUSTOM || source === "CUSTOM" || source === "ADMIN") {
+    return RULE_SOURCE.CUSTOM;
+  }
+  return RULE_SOURCE.AI;
+}
 
 function toAiRule(rule, index) {
   const ruleName =
@@ -6,7 +20,7 @@ function toAiRule(rule, index) {
 
   return {
     ruleName: String(ruleName),
-    source: RULE_SOURCE.AI,
+    source: normalizeRuleSource(rule?.source || RULE_SOURCE.AI),
     ruleId: rule?.ruleId || `AI-${String(index + 1).padStart(3, "0")}`,
     type: rule?.type || "validation",
     description: rule?.description || "",
@@ -26,10 +40,48 @@ function isPredefinedName(name) {
   );
 }
 
+function extractFields(rulesPayload) {
+  if (!rulesPayload) return [];
+  if (Array.isArray(rulesPayload.fields)) return rulesPayload.fields;
+  if (rulesPayload.rules && Array.isArray(rulesPayload.rules.fields)) {
+    return rulesPayload.rules.fields;
+  }
+  return [];
+}
+
+/** Latest admin-authored CUSTOM rules, keyed by uppercase fieldName. */
+export function extractCustomRulesByField(rulesPayload) {
+  const byField = new Map();
+  for (const field of extractFields(rulesPayload)) {
+    const fieldName = String(field?.fieldName || "").trim();
+    if (!fieldName) continue;
+    const custom = (Array.isArray(field.rules) ? field.rules : []).filter(
+      (rule) => normalizeRuleSource(rule?.source) === RULE_SOURCE.CUSTOM,
+    );
+    if (!custom.length) continue;
+    byField.set(fieldName.toUpperCase(), custom);
+  }
+  return byField;
+}
+
+export function lookupCustomRulesForField(fieldName, customByField) {
+  if (!customByField?.size) return [];
+  const direct = customByField.get(String(fieldName || "").toUpperCase());
+  if (direct?.length) return direct;
+  const matchedKey = resolveFieldColumn(fieldName, [...customByField.keys()]);
+  if (!matchedKey) return [];
+  return customByField.get(String(matchedKey).toUpperCase()) || [];
+}
+
 /**
- * Review payload: predefined + AI (for UI only).
+ * Review payload: custom + predefined + AI (for UI only).
  */
-export function assembleFieldRules(businessObject, fields, aiByField = []) {
+export function assembleFieldRules(
+  businessObject,
+  fields,
+  aiByField = [],
+  customByField = new Map(),
+) {
   const aiMap = new Map(
     (aiByField || []).map((entry) => [
       String(entry.fieldName).toUpperCase(),
@@ -45,6 +97,7 @@ export function assembleFieldRules(businessObject, fields, aiByField = []) {
 
   const fieldRules = (fields || []).map((field) => {
     const predefined = buildPredefinedRulesForField(field);
+    const customRules = lookupCustomRulesForField(field.fieldName, customByField);
     const rawAi = aiMap.get(String(field.fieldName).toUpperCase()) || [];
     const aiRules = rawAi
       .map((rule, index) => toAiRule(rule, index))
@@ -59,7 +112,7 @@ export function assembleFieldRules(businessObject, fields, aiByField = []) {
         length: field.length === "" || field.length == null ? "" : field.length,
         defaultValue: field.defaultValue ?? "",
       },
-      rules: [...predefined, ...aiRules],
+      rules: [...customRules, ...predefined, ...aiRules],
     };
   });
 
@@ -74,9 +127,32 @@ function persistKeyFlag(field) {
   return String(raw).toUpperCase() === "X" ? "X" : "";
 }
 
+function toPersistableRule(rule) {
+  const source = normalizeRuleSource(rule.source);
+  const persisted = {
+    ruleId: rule.ruleId || undefined,
+    ruleName: rule.ruleName,
+    source,
+    type: rule.type || "validation",
+    description: rule.description || "",
+    constraint: rule.constraint || "",
+    severity: rule.severity || "error",
+    category: rule.category || rule.type || "validation",
+  };
+
+  if (source === RULE_SOURCE.CUSTOM) {
+    persisted.createdBy = rule.createdBy ?? null;
+    persisted.createdAt = rule.createdAt ?? null;
+    persisted.updatedBy = rule.updatedBy ?? null;
+    persisted.updatedAt = rule.updatedAt ?? null;
+  }
+
+  return persisted;
+}
+
 /**
- * DB persistence payload: Business Object + fieldName + key flag + AI rules.
- * Does NOT include predefined rules or other Excel metadata.
+ * DB persistence payload: Business Object + fieldName + key flag + AI + custom rules.
+ * Does NOT include predefined rules (those are applied at evaluation time).
  * key = "X" marks a primary/business key; anything else is non-key.
  */
 export function toPersistableAiRules(businessObject, rules) {
@@ -86,8 +162,8 @@ export function toPersistableAiRules(businessObject, rules) {
     businessObject: normalized.businessObject || businessObject,
     fields: (normalized.fields || [])
       .map((field) => {
-        const aiOnly = (field.rules || []).filter(
-          (rule) => String(rule.source || "").toUpperCase() === RULE_SOURCE.AI,
+        const persistedRules = (field.rules || []).filter((rule) =>
+          PERSISTED_SOURCES.has(normalizeRuleSource(rule.source)),
         );
         return {
           fieldName: field.fieldName,
@@ -98,15 +174,7 @@ export function toPersistableAiRules(businessObject, rules) {
               : "",
           length:
             field.metadata?.length ?? field.length ?? "",
-          rules: aiOnly.map((rule) => ({
-            ruleName: rule.ruleName,
-            source: RULE_SOURCE.AI,
-            type: rule.type || "validation",
-            description: rule.description || "",
-            constraint: rule.constraint || "",
-            severity: rule.severity || "error",
-            category: rule.category || rule.type || "validation",
-          })),
+          rules: persistedRules.map(toPersistableRule),
         };
       })
       .filter((field) => field.fieldName),
@@ -132,10 +200,7 @@ export function normalizeRulesForPersistence(businessObject, rules) {
           metadata,
           rules: field.rules.map((rule, index) => ({
             ruleName: rule.ruleName || rule.rule || `Rule ${index + 1}`,
-            source:
-              String(rule.source || "").toUpperCase() === "PREDEFINED"
-                ? RULE_SOURCE.PREDEFINED
-                : RULE_SOURCE.AI,
+            source: normalizeRuleSource(rule.source),
             ruleId: rule.ruleId,
             type: rule.type,
             description: rule.description,
@@ -143,6 +208,10 @@ export function normalizeRulesForPersistence(businessObject, rules) {
             severity: rule.severity,
             category: rule.category,
             keyEnforced: rule.keyEnforced,
+            createdBy: rule.createdBy,
+            createdAt: rule.createdAt,
+            updatedBy: rule.updatedBy,
+            updatedAt: rule.updatedAt,
           })),
         };
       }

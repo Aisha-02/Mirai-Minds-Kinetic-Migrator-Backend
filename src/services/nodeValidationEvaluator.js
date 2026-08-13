@@ -11,6 +11,7 @@ import {
   checkDateRelatedRule,
   checkSapTypeRule,
 } from "./sapTypeValidation.js";
+import { prioritizeFieldRules, ruleSourceRank } from "./rulePriority.js";
 
 const PREVIEW_ROW_LIMIT = 20;
 const AFFECTED_SAMPLE_LIMIT = 25;
@@ -41,6 +42,22 @@ function ruleText(rule) {
     .toLowerCase();
 }
 
+function parsePadToLength(text) {
+  const haystack = String(text || "").toLowerCase();
+  const pads =
+    haystack.includes("leading") ||
+    haystack.includes("pad") ||
+    haystack.includes("append") ||
+    haystack.includes("add");
+  if (!pads) return null;
+  const match =
+    haystack.match(/(\d+)\s*characters?\s*long/) ||
+    haystack.match(/make it\s*(\d+)/) ||
+    haystack.match(/pad(?:ded)?(?: with leading zeros?)? to\s*(\d+)/) ||
+    haystack.match(/(\d+)\s*characters?/);
+  return match ? Number(match[1]) : null;
+}
+
 function collectColumns(rows) {
   const columns = [];
   const seen = new Set();
@@ -60,6 +77,21 @@ function resolveColumn(fieldName, columns) {
 }
 
 /** Primary key only when validation_rules field has key = "X". */
+function isUniquenessRule(rule) {
+  const ruleId = String(rule?.ruleId || "");
+  const constraint = String(rule?.constraint || "");
+  const name = String(rule?.ruleName || "")
+    .trim()
+    .toLowerCase();
+  return (
+    ruleId === "COMMON-DUPLICATE" ||
+    constraint === "UNIQUE_REQUIRED" ||
+    constraint === "FLAG_DUPLICATES" ||
+    name === "duplicate check" ||
+    name.startsWith("duplicate check")
+  );
+}
+
 function fieldKeyFlag(field) {
   const raw = field?.key ?? field?.metadata?.key ?? "";
   return String(raw).toUpperCase() === "X" ? "X" : "";
@@ -97,15 +129,7 @@ function mergeFields(fields) {
     let rules =
       field.key === "X"
         ? [...field.rules]
-        : field.rules.filter((r) => {
-            const text = ruleText(r);
-            return !(
-              text.includes("duplicate") ||
-              r?.ruleId === "COMMON-DUPLICATE" ||
-              r?.constraint === "UNIQUE_REQUIRED" ||
-              r?.constraint === "FLAG_DUPLICATES"
-            );
-          });
+        : field.rules.filter((r) => !isUniquenessRule(r));
 
     for (const pre of buildPredefinedRulesForField({
       fieldName: field.fieldName,
@@ -130,7 +154,7 @@ function mergeFields(fields) {
       key: field.key,
       dataType: field.dataType,
       length: field.length,
-      rules,
+      rules: prioritizeFieldRules(rules),
     };
   });
 }
@@ -197,7 +221,15 @@ function checkValue(rule, value, field) {
     };
   }
 
-  if (text.includes("leading zero") && !empty && /^0+\d/.test(s)) {
+  const padLength = parsePadToLength(text);
+  if (padLength && !empty && /^\d+$/.test(s) && s.length < padLength) {
+    return {
+      violated: true,
+      reason: `Length ${s.length} is shorter than ${padLength}; pad with leading zeros`,
+    };
+  }
+
+  if (text.includes("leading zero") && !parsePadToLength(text) && !empty && /^0+\d/.test(s)) {
     return { violated: true, reason: "Value has leading zeros" };
   }
 
@@ -242,8 +274,9 @@ function evaluate(rows, rulesPayload, businessObject) {
           : "error";
 
       let finding;
-      if (text.includes("duplicate") || rule.ruleId === "COMMON-DUPLICATE") {
-        // Duplicate Check is only for primary keys (key = "X")
+      if (isUniquenessRule(rule)) {
+        // Duplicate uniqueness only when this field is stored as key = "X"
+      // on the loaded validation_rules row (any business object).
         if (field.key !== "X") continue;
         const { affected, samples } = duplicateRows(rows, column);
         if (!affected.length) continue;
@@ -264,10 +297,12 @@ function evaluate(rows, rulesPayload, businessObject) {
           rule: {
             ruleName: rule.ruleName,
             source: rule.source,
+            type: rule.type,
             description: rule.description,
             constraint: rule.constraint,
             severity: rule.severity,
             category: rule.category || "uniqueness",
+            ruleId: rule.ruleId,
           },
         };
       } else {
@@ -302,10 +337,12 @@ function evaluate(rows, rulesPayload, businessObject) {
           rule: {
             ruleName: rule.ruleName,
             source: rule.source,
+            type: rule.type,
             description: rule.description,
             constraint: rule.constraint,
             severity: rule.severity,
             category: rule.category,
+            ruleId: rule.ruleId,
           },
         };
       }
@@ -342,9 +379,17 @@ function evaluate(rows, rulesPayload, businessObject) {
     }
   }
 
-  const fieldGroups = [...fieldGroupsMap.values()].sort(
-    (a, b) => b.errorCount - a.errorCount || b.warningCount - a.warningCount,
-  );
+  const fieldGroups = [...fieldGroupsMap.values()]
+    .map((group) => ({
+      ...group,
+      findings: [...group.findings].sort(
+        (left, right) =>
+          ruleSourceRank(left.rule?.source) - ruleSourceRank(right.rule?.source),
+      ),
+    }))
+    .sort(
+      (a, b) => b.errorCount - a.errorCount || b.warningCount - a.warningCount,
+    );
 
   return {
     summary: {

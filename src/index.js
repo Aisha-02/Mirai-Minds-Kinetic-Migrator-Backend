@@ -57,4 +57,7 @@ app.listen(port, () => {
   console.log(
     `S3: bucket=${process.env.AWS_S3_BUCKET || "MISSING — file uploads will fail"}`,
   );
+  console.log(
+    `Comparison service: url=${process.env.COMPARISON_SERVICE_URL || "not set — using in-memory comparisonEngine"}`,
+  );
 });

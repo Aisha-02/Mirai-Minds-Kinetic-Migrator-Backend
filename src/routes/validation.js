@@ -210,6 +210,7 @@ router.post(
       const lambdaResult = await runValidationRulesLambda({
         businessObject: rulesBusinessObject,
         rows: mappedRows,
+        applyFixes: true,
       });
 
       const aligned = alignValidationOutputToSapFields(
@@ -221,6 +222,37 @@ router.post(
       const ruleSetRow = await findValidationRulesById(lambdaResult.ruleSet.id);
       const rulesSnapshot = ruleSetRow?.rules ?? { businessObject: rulesBusinessObject };
 
+      let refinedRows = Array.isArray(lambdaResult.refinedRows)
+        ? lambdaResult.refinedRows
+        : mappedRows;
+      let appliedFixes = Array.isArray(lambdaResult.appliedFixes)
+        ? lambdaResult.appliedFixes
+        : [];
+      let skippedFixes = Array.isArray(lambdaResult.skippedFixes)
+        ? lambdaResult.skippedFixes
+        : [];
+
+      if (!Array.isArray(lambdaResult.refinedRows)) {
+        const { applyAllFindings } = await import("../services/ruleFixService.js");
+        const fixed = applyAllFindings(mappedRows, aligned.findings);
+        refinedRows = fixed.rows;
+        appliedFixes = fixed.applied;
+        skippedFixes = fixed.skipped;
+      }
+
+      const refinedFilename = buildRefinedFilename(req.file.originalname);
+      const autoFixMeta = {
+        ready: true,
+        refinedFilename,
+        columnMapping,
+        fixesApplied: appliedFixes.length,
+        fixesSkipped: skippedFixes.length,
+        appliedFixes,
+        skippedFixes,
+        sapMetadataUsed: sapMapping.sapMetadataUsed,
+        rowCount: refinedRows.length,
+      };
+
       const session = await createCleanupSession({
         userId: req.user.id,
         filename: req.file.originalname,
@@ -230,7 +262,7 @@ router.post(
         ruleSetId: lambdaResult.ruleSet.id,
         rulesSnapshot,
         originalData: originalRows,
-        currentData: mappedRows,
+        currentData: refinedRows,
         findings: aligned.findings,
         report: {
           ...aligned.report,
@@ -241,9 +273,20 @@ router.post(
           sapColumns: columns,
           sapFieldNames,
           sapMetadataUsed: sapMapping.sapMetadataUsed,
+          autoFix: autoFixMeta,
         },
         summary: lambdaResult.summary,
       });
+
+      try {
+        const uploaded = await uploadRefinedValidationFile(session, refinedRows);
+        await updateCleanupSession(session.id, {
+          refinedS3Key: uploaded.refinedKey,
+          refinedFilename: uploaded.refinedFilename,
+        });
+      } catch (uploadErr) {
+        console.error("[validation] refined file upload failed:", uploadErr.message);
+      }
 
       return res.status(200).json({
         sessionId: session.id,
@@ -267,13 +310,23 @@ router.post(
           sapColumns: columns,
           sapFieldNames,
           sapMetadataUsed: sapMapping.sapMetadataUsed,
+          autoFix: autoFixMeta,
         },
         previewRows: remapRowsToPreloadColumns(
-          mappedRows.slice(0, 20),
+          refinedRows.slice(0, 20),
           columnMapping,
           originalColumns,
         ),
-        evaluator: String(process.env.VALIDATION_LAMBDA_MODE || "local"),
+        evaluator: lambdaResult.evaluator || String(process.env.VALIDATION_LAMBDA_MODE || "local"),
+        autoFix: {
+          ok: true,
+          ...autoFixMeta,
+          previewRefinedRows: remapRowsToPreloadColumns(
+            refinedRows.slice(0, 20),
+            columnMapping,
+            originalColumns,
+          ),
+        },
       });
     } catch (err) {
       return next(err);

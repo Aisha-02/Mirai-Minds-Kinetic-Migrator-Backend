@@ -178,14 +178,14 @@ async function invokeAwsLambda(event) {
  * Prefer AWS Lambda (Python). Locally: Python script, else Node evaluator
  * that still queries validation_rules and returns findings only.
  */
-export async function runValidationRulesLambda({ businessObject, rows }) {
+export async function runValidationRulesLambda({ businessObject, rows, applyFixes = true }) {
   const mode = String(
     process.env.VALIDATION_LAMBDA_MODE || "local",
   ).toLowerCase();
 
   if (mode === "aws") {
     const db = await buildDbConfigForPython();
-    const result = await invokeAwsLambda({ businessObject, rows, db });
+    const result = await invokeAwsLambda({ businessObject, rows, db, applyFixes });
     if (!result?.ok) {
       const err = new Error(
         result?.error || "Validation rules evaluation failed",
@@ -204,7 +204,7 @@ export async function runValidationRulesLambda({ businessObject, rows }) {
   // local: try Python Lambda script first
   try {
     const db = await buildDbConfigForPython();
-    const result = await runLocalPython({ businessObject, rows, db });
+    const result = await runLocalPython({ businessObject, rows, db, applyFixes });
     if (!result?.ok) {
       const err = new Error(
         result?.error || "Validation rules evaluation failed",
@@ -234,6 +234,19 @@ export async function runValidationRulesLambda({ businessObject, rows }) {
       msg.slice(0, 200),
     );
     const result = await runValidationRulesLocalNode({ businessObject, rows });
+    if (applyFixes) {
+      const { applyAllFindings } = await import("./ruleFixService.js");
+      const fixed = applyAllFindings(rows, result.findings || []);
+      return {
+        ...result,
+        evaluator: "node-local",
+        refinedRows: fixed.rows,
+        appliedFixes: fixed.applied,
+        skippedFixes: fixed.skipped,
+        fixesApplied: fixed.applied.length,
+        fixesSkipped: fixed.skipped.length,
+      };
+    }
     return { ...result, evaluator: "node-local" };
   }
 }

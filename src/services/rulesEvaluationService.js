@@ -11,6 +11,7 @@ import {
   RULE_SOURCE,
 } from "./commonRules.js";
 import { resolveFieldColumn } from "../constants/fieldColumnAliases.js";
+import { prioritizeFieldRules, ruleSourceRank } from "./rulePriority.js";
 
 const MAX_AFFECTED_ROWS_SAMPLE = 25;
 const MAX_SAMPLE_VALUES = 8;
@@ -76,12 +77,17 @@ function fieldKeyFlag(field) {
 }
 
 function isDuplicateRule(rule) {
-  const text = ruleText(rule);
+  const ruleId = String(rule?.ruleId || "");
+  const constraint = String(rule?.constraint || "");
+  const name = String(rule?.ruleName || "")
+    .trim()
+    .toLowerCase();
   return (
-    text.includes("duplicate") ||
-    rule?.ruleId === COMMON_RULE_IDS.DUPLICATE ||
-    rule?.constraint === "UNIQUE_REQUIRED" ||
-    rule?.constraint === "FLAG_DUPLICATES"
+    ruleId === COMMON_RULE_IDS.DUPLICATE ||
+    constraint === "UNIQUE_REQUIRED" ||
+    constraint === "FLAG_DUPLICATES" ||
+    name === "duplicate check" ||
+    name.startsWith("duplicate check")
   );
 }
 
@@ -99,6 +105,22 @@ function isNullEmptyRule(rule) {
 function isTrimRule(rule) {
   const text = ruleText(rule);
   return text.includes("trim whitespace") || rule?.ruleId === COMMON_RULE_IDS.TRIM;
+}
+
+function parsePadToLength(text) {
+  const haystack = String(text || "").toLowerCase();
+  const pads =
+    haystack.includes("leading") ||
+    haystack.includes("pad") ||
+    haystack.includes("append") ||
+    haystack.includes("add");
+  if (!pads) return null;
+  const match =
+    haystack.match(/(\d+)\s*characters?\s*long/) ||
+    haystack.match(/make it\s*(\d+)/) ||
+    haystack.match(/pad(?:ded)?(?: with leading zeros?)? to\s*(\d+)/) ||
+    haystack.match(/(\d+)\s*characters?/);
+  return match ? Number(match[1]) : null;
 }
 
 /**
@@ -126,6 +148,16 @@ function checkValueAgainstRule(rule, value, row, fieldName, columnIndex) {
     return { violated: false };
   }
 
+  const padLength = parsePadToLength(text);
+  if (padLength && !empty) {
+    if (/^\d+$/.test(str) && str.length < padLength) {
+      return {
+        violated: true,
+        reason: `Length ${str.length} is shorter than ${padLength}; pad with leading zeros`,
+      };
+    }
+  }
+
   if (
     text.includes("must not be empty") ||
     text.includes("should not be empty") ||
@@ -149,6 +181,7 @@ function checkValueAgainstRule(rule, value, row, fieldName, columnIndex) {
 
   if (
     (text.includes("leading zero") || text.includes("leading zeros")) &&
+    !parsePadToLength(text) &&
     !empty
   ) {
     if (/^0+\d/.test(str)) {
@@ -296,7 +329,7 @@ function enrichFieldsWithPredefined(fields) {
       if (!already) merged.push(rule);
     }
 
-    return { ...field, rules: merged, _isKey: isKey };
+    return { ...field, rules: prioritizeFieldRules(merged), _isKey: isKey };
   });
 }
 
@@ -362,7 +395,8 @@ export function evaluateValidationRules(rows, rulesPayload) {
       rulesChecked += 1;
 
       if (isDuplicateRule(rule)) {
-        // Duplicate Check only for primary keys (key = "X")
+        // Duplicate uniqueness only when this field is stored as key = "X"
+        // on the loaded validation_rules row (any business object).
         if (field.key !== "X" && !field._isKey) continue;
         const { affectedRowNumbers, samples } = collectDuplicateRowNumbers(
           data,
@@ -465,6 +499,11 @@ export function evaluateValidationRules(rows, rulesPayload) {
       });
     }
   }
+
+  findings.sort(
+    (left, right) =>
+      ruleSourceRank(left.rule?.source) - ruleSourceRank(right.rule?.source),
+  );
 
   const errorCount = findings
     .filter((f) => f.severity === "error")

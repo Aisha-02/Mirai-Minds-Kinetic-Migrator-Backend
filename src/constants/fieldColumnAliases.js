@@ -1,7 +1,11 @@
 /**
  * Equivalent SAP / preload column names for validation rule field matching.
+ * Works for every business object (MM, PO, SO, BP, GL, …).
  * Rule field names from Admin (e.g. MATERIAL_NUMBER) often differ from
  * preload extract headers (e.g. MATNR).
+ *
+ * Groups must never mix a parent field with a sibling (e.g. SALESORDER vs
+ * SALESORDERTYPE, MATERIAL vs MATERIALTYPE). Those are different fields.
  */
 
 /** @type {readonly (readonly string[])[]} */
@@ -25,6 +29,7 @@ export const FIELD_EQUIVALENCE_GROUPS = Object.freeze([
   ["PARTNERNUMBER", "PARTNER", "BPNUMBER", "KUNNR", "LIFNR"],
   // Sales Order (SO)
   ["SALESORDERNUMBER", "VBELN", "SALESORDER"],
+  ["SALESORDERTYPE", "AUART", "DOCTYPE"],
   ["SALESORDERITEM", "POSNR", "ITEM"],
   // GL Account
   ["GLACCOUNT", "SAKNR", "GLACCOUNTNUMBER", "HKONT"],
@@ -63,22 +68,25 @@ function areEquivalent(fieldNorm, columnNorm) {
 }
 
 /**
- * Resolve a rule field name to an uploaded column header.
- * @param {string} fieldName
- * @param {string[]} columns
- * @returns {string | null}
+ * Map a stored validation_rules field name to a preload/SAP column.
+ * Same rules for every business object:
+ * 1. Exact name (ignoring case, spaces, underscores)
+ * 2. Declared SAP aliases in FIELD_EQUIVALENCE_GROUPS
+ * Never use substring matching — "salesOrder" must not bind to "salesOrderType",
+ * "material" must not bind to "materialType", "po" must not bind to "poItem", etc.
+ * Primary keys are not inferred from names; uniqueness uses field.key === "X".
  */
 export function resolveFieldColumn(fieldName, columns) {
   const target = normalizeFieldKey(fieldName);
   if (!target) return null;
 
-  const byNorm = new Map(columns.map((col) => [normalizeFieldKey(col), col]));
+  const byNorm = new Map();
+  for (const col of columns || []) {
+    const norm = normalizeFieldKey(col);
+    if (norm && !byNorm.has(norm)) byNorm.set(norm, col);
+  }
 
   if (byNorm.has(target)) return byNorm.get(target);
-
-  for (const [norm, col] of byNorm) {
-    if (norm.includes(target) || target.includes(norm)) return col;
-  }
 
   for (const [norm, col] of byNorm) {
     if (areEquivalent(target, norm)) return col;

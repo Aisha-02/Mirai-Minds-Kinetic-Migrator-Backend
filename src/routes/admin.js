@@ -24,6 +24,11 @@ import { validateFieldMetadata } from "../services/excelValidator.js";
 import { generateSchemaMapping } from "../services/schemaMappingService.js";
 import { getBusinessObjectMetadata } from "../services/sapMetadataService.js";
 import {
+  addCustomValidationRule,
+  deleteCustomValidationRule,
+  updateCustomValidationRule,
+} from "../services/customValidationRulesService.js";
+import {
   assertS3Configured,
   buildMappingExportKey,
   buildRulesExportKey,
@@ -481,6 +486,115 @@ router.post(
         err.message =
           err.message || "LLM access denied. Check Bedrock credentials and model access.";
       }
+      return next(err);
+    }
+  },
+);
+
+/**
+ * POST /api/admin/validation-rules
+ * Append an admin-authored custom rule to validation_rules.rules (does not replace AI rules).
+ */
+router.post(
+  "/validation-rules",
+  requireAuth,
+  requireRole("admin"),
+  async (req, res, next) => {
+    try {
+      const businessObject = String(req.body?.businessObject || "").trim();
+      const ruleSetId = String(req.body?.ruleSetId || "").trim() || null;
+
+      const result = await addCustomValidationRule({
+        businessObject,
+        ruleSetId,
+        body: req.body,
+        userId: req.user.id,
+      });
+
+      return res.status(result.created ? 201 : 200).json({
+        message: result.created
+          ? "Created a new rule set with the custom validation rule"
+          : "Appended custom validation rule without modifying AI-generated rules",
+        rule: result.rule,
+        ruleSet: result.ruleSet,
+      });
+    } catch (err) {
+      return next(err);
+    }
+  },
+);
+
+/**
+ * PUT /api/admin/validation-rules/:ruleId
+ * Edit an admin-added custom rule only. AI-generated rules are read-only.
+ */
+router.put(
+  "/validation-rules/:ruleId",
+  requireAuth,
+  requireRole("admin"),
+  async (req, res, next) => {
+    try {
+      const ruleId = String(req.params.ruleId || "").trim();
+      if (!ruleId) {
+        return res.status(400).json({ error: "ruleId is required" });
+      }
+
+      const businessObject = String(req.body?.businessObject || "").trim() || null;
+      const ruleSetId = String(req.body?.ruleSetId || "").trim() || null;
+
+      const result = await updateCustomValidationRule({
+        ruleId,
+        businessObject,
+        ruleSetId,
+        body: req.body,
+        userId: req.user.id,
+      });
+
+      return res.json({
+        message: "Updated custom validation rule",
+        rule: result.rule,
+        ruleSet: result.ruleSet,
+      });
+    } catch (err) {
+      return next(err);
+    }
+  },
+);
+
+/**
+ * DELETE /api/admin/validation-rules/:ruleId
+ * Delete an admin-added custom rule only. AI-generated rules are read-only.
+ */
+router.delete(
+  "/validation-rules/:ruleId",
+  requireAuth,
+  requireRole("admin"),
+  async (req, res, next) => {
+    try {
+      const ruleId = String(req.params.ruleId || "").trim();
+      if (!ruleId) {
+        return res.status(400).json({ error: "ruleId is required" });
+      }
+
+      const businessObject = String(
+        req.body?.businessObject || req.query?.businessObject || "",
+      ).trim() || null;
+      const ruleSetId = String(
+        req.body?.ruleSetId || req.query?.ruleSetId || "",
+      ).trim() || null;
+
+      const result = await deleteCustomValidationRule({
+        ruleId,
+        businessObject,
+        ruleSetId,
+      });
+
+      return res.json({
+        message: "Deleted custom validation rule",
+        deletedRuleId: result.deletedRuleId,
+        ruleSet: result.ruleSet,
+      });
+    } catch (err) {
       return next(err);
     }
   },

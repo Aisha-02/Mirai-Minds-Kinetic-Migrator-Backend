@@ -1,11 +1,17 @@
 import { query } from "../db.js";
 
 /**
- * Persist Business Object + field-wise AI rules only.
+ * Persist Business Object + field-wise AI and custom rules.
  * rules shape:
  * {
  *   businessObject: "MM",
- *   fields: [{ fieldName: "MATNR", rules: [{ ruleName, source: "AI", ... }] }]
+ *   fields: [{
+ *     fieldName: "MATNR",
+ *     key: "X",
+ *     dataType: "...",
+ *     length: "...",
+ *     rules: [{ ruleName, source: "AI" | "CUSTOM", ruleId, type, description, constraint, ... }]
+ *   }]
  * }
  */
 export async function createValidationRules({
@@ -46,6 +52,37 @@ export async function findValidationRulesById(id) {
      WHERE id = $1
      LIMIT 1`,
     [id],
+  );
+  return result.rows[0] ?? null;
+}
+
+export async function updateValidationRulesJson({ id, rules }) {
+  const result = await query(
+    `UPDATE validation_rules
+     SET rules = $2::jsonb, updated_at = NOW()
+     WHERE id = $1
+     RETURNING id, business_object, rules, created_by, created_at, updated_at`,
+    [id, JSON.stringify(rules)],
+  );
+  return result.rows[0] ?? null;
+}
+
+/**
+ * Find the most recent rule set that contains a given nested ruleId.
+ */
+export async function findValidationRulesByNestedRuleId(ruleId) {
+  const result = await query(
+    `SELECT id, business_object, rules, created_by, created_at, updated_at
+     FROM validation_rules
+     WHERE EXISTS (
+       SELECT 1
+       FROM jsonb_array_elements(COALESCE(rules->'fields', '[]'::jsonb)) AS field
+       CROSS JOIN LATERAL jsonb_array_elements(COALESCE(field->'rules', '[]'::jsonb)) AS rule
+       WHERE rule->>'ruleId' = $1
+     )
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [ruleId],
   );
   return result.rows[0] ?? null;
 }

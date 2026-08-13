@@ -5,6 +5,12 @@
 
 import crypto from "crypto";
 import { resolveFieldColumn } from "../constants/fieldColumnAliases.js";
+import {
+  compareFindingsByPriority,
+  isTransformationRule,
+  lowerPrioritySkipReason,
+  ruleSourceRank,
+} from "./rulePriority.js";
 
 function normalizeKey(value) {
   return String(value ?? "")
@@ -25,6 +31,22 @@ function ruleText(rule) {
     .filter(Boolean)
     .join(" ")
     .toLowerCase();
+}
+
+function parsePadToLength(text) {
+  const haystack = String(text || "").toLowerCase();
+  const pads =
+    haystack.includes("leading") ||
+    haystack.includes("pad") ||
+    haystack.includes("append") ||
+    haystack.includes("add");
+  if (!pads) return null;
+  const match =
+    haystack.match(/(\d+)\s*characters?\s*long/) ||
+    haystack.match(/make it\s*(\d+)/) ||
+    haystack.match(/pad(?:ded)?(?: with leading zeros?)? to\s*(\d+)/) ||
+    haystack.match(/(\d+)\s*characters?/);
+  return match ? Number(match[1]) : null;
 }
 
 function toNumber(value) {
@@ -88,9 +110,9 @@ export function inferTransformFromRule(finding) {
   const maxLengthMatch = text.match(/max(?:imum)?\s*length\s*(\d+)/i);
 
   if (
-    text.includes("duplicate") ||
     rule?.ruleId === "COMMON-DUPLICATE" ||
-    rule?.constraint === "UNIQUE_REQUIRED"
+    rule?.constraint === "UNIQUE_REQUIRED" ||
+    String(rule?.ruleName || "").trim().toLowerCase() === "duplicate check"
   ) {
     return {
       type: "remove_duplicate_rows",
@@ -124,7 +146,19 @@ export function inferTransformFromRule(finding) {
     };
   }
 
-  if (text.includes("leading zero")) {
+  const padLength = parsePadToLength(text);
+  if (padLength) {
+    return {
+      type: "fit_length",
+      params: { max: padLength },
+      label: `Pad with leading zeros to ${padLength} characters (custom/admin transformation)`,
+    };
+  }
+
+  if (
+    (text.includes("leading zero") || text.includes("leading zeros")) &&
+    !padLength
+  ) {
     return {
       type: "strip_leading_zeros",
       label: "Strip leading zeros (per rule)",
@@ -454,17 +488,44 @@ export function applyProposalToRows(rows, proposal) {
 export function applyAllFindings(rows, findings) {
   let data = (Array.isArray(rows) ? rows : []).map((row) => ({ ...row }));
   const list = Array.isArray(findings) ? [...findings] : [];
-  list.sort((a, b) => {
-    const aErr = String(a.severity || "").toLowerCase() === "error" ? 0 : 1;
-    const bErr = String(b.severity || "").toLowerCase() === "error" ? 0 : 1;
-    return aErr - bErr;
-  });
+  list.sort(compareFindingsByPriority);
+
+  const winningTransformRank = new Map();
+  for (const finding of list) {
+    const rule = finding.rule || finding;
+    if (!isTransformationRule(rule)) continue;
+    const fieldKey = String(finding.fieldName || "").toUpperCase();
+    const rank = ruleSourceRank(rule.source);
+    const current = winningTransformRank.get(fieldKey);
+    if (current === undefined || rank < current) {
+      winningTransformRank.set(fieldKey, rank);
+    }
+  }
 
   const applied = [];
   const skipped = [];
   const seen = new Set();
 
   for (const finding of list) {
+    const rule = finding.rule || finding;
+    const fieldName = finding.fieldName;
+    const fieldKey = String(fieldName || "").toUpperCase();
+    const sourceRank = ruleSourceRank(rule.source);
+    const winningRank = winningTransformRank.get(fieldKey);
+
+    if (
+      isTransformationRule(rule) &&
+      winningRank !== undefined &&
+      sourceRank > winningRank
+    ) {
+      skipped.push({
+        fieldName,
+        ruleName: finding.ruleName || finding.ruleViolated,
+        reason: lowerPrioritySkipReason(winningRank),
+      });
+      continue;
+    }
+
     const dedupeKey = `${finding.fieldName}::${finding.ruleName || finding.ruleViolated}`;
     if (seen.has(dedupeKey)) continue;
     seen.add(dedupeKey);
@@ -484,6 +545,7 @@ export function applyAllFindings(rows, findings) {
       fieldName: finding.fieldName,
       ruleName: finding.ruleName || finding.ruleViolated,
       transform: result.proposal.transform?.type,
+      source: rule.source || null,
       affectedCount: result.proposal.affectedCount,
     });
   }

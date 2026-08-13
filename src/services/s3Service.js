@@ -17,6 +17,8 @@ import {
   S3Client,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl as awsGetSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { createWriteStream } from "node:fs";
+import { pipeline } from "node:stream/promises";
 
 let client = null;
 
@@ -230,6 +232,31 @@ export async function getFile(key) {
       body,
       contentType: response.ContentType || "application/octet-stream",
     };
+  } catch (err) {
+    throw mapS3Error(err, { operation: "download", key });
+  }
+}
+
+/**
+ * Stream an S3 object to a local file without loading it entirely into memory.
+ *
+ * @param {string} key
+ * @param {string} destPath
+ */
+export async function downloadFileToPath(key, destPath) {
+  assertS3Configured();
+  const bucket = getBucket();
+
+  try {
+    const response = await getClient().send(
+      new GetObjectCommand({ Bucket: bucket, Key: key }),
+    );
+    if (!response.Body) {
+      const err = new Error("Storage object body was empty");
+      err.status = 502;
+      throw err;
+    }
+    await pipeline(response.Body, createWriteStream(destPath));
   } catch (err) {
     throw mapS3Error(err, { operation: "download", key });
   }

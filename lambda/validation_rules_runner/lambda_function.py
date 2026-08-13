@@ -1,6 +1,7 @@
 """
 AWS Lambda: fetch validation_rules for a business object and evaluate
-preload rows. Returns findings only — does not transform/clean data.
+preload rows against that ruleset (any BO). Optionally apply stored-rule
+transforms and return refined rows. Uniqueness is only for fields with key=X.
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ FIELD_EQUIVALENCE_GROUPS: list[list[str]] = [
     ["VENDORNUMBER", "LIFNR", "VENDOR"],
     ["PARTNERNUMBER", "PARTNER", "BPNUMBER", "KUNNR", "LIFNR"],
     ["SALESORDERNUMBER", "VBELN", "SALESORDER"],
+    ["SALESORDERTYPE", "AUART", "DOCTYPE"],
     ["SALESORDERITEM", "POSNR", "ITEM"],
     ["GLACCOUNT", "SAKNR", "GLACCOUNTNUMBER", "HKONT"],
 ]
@@ -79,16 +81,99 @@ def _rule_text(rule: dict) -> str:
     return " ".join(str(p) for p in parts if p).lower()
 
 
+def _rule_source_rank(source: Any) -> int:
+    value = str(source or "").strip().upper()
+    if value in {"CUSTOM", "ADMIN"}:
+        return 0
+    if value == "PREDEFINED":
+        return 1
+    if value == "AI":
+        return 2
+    return 3
+
+
+def _is_transformation_rule(rule: dict) -> bool:
+    rule_type = str(rule.get("type") or "").lower()
+    category = str(rule.get("category") or "").lower()
+    return rule_type == "transformation" or category == "transformation"
+
+
+def _rule_conflict_key(rule: dict) -> str:
+    if _is_transformation_rule(rule):
+        return "transformation"
+    text = _rule_text(rule)
+    rule_id = str(rule.get("ruleId") or "")
+    if (
+        "duplicate" in text
+        or rule_id == "COMMON-DUPLICATE"
+        or rule.get("constraint") in ("UNIQUE_REQUIRED", "FLAG_DUPLICATES")
+    ):
+        return "duplicate"
+    if (
+        "null/empty" in text
+        or "null check" in text
+        or rule_id == "COMMON-NULL-EMPTY"
+        or rule.get("constraint") in ("NOT_NULL_OR_EMPTY", "FLAG_NULL_OR_EMPTY")
+    ):
+        return "null_empty"
+    return f"unique:{rule_id or rule.get('ruleName') or text}"
+
+
+def _prioritize_field_rules(rules: list[dict]) -> list[dict]:
+    items = list(rules or [])
+    best_rank: dict[str, int] = {}
+    for rule in items:
+        key = _rule_conflict_key(rule)
+        rank = _rule_source_rank(rule.get("source"))
+        current = best_rank.get(key)
+        if current is None or rank < current:
+            best_rank[key] = rank
+
+    filtered = [
+        rule
+        for rule in items
+        if _rule_source_rank(rule.get("source")) == best_rank[_rule_conflict_key(rule)]
+    ]
+
+    def sort_key(rule: dict) -> tuple[int, int]:
+        transform = 0 if _is_transformation_rule(rule) else 1
+        return (_rule_source_rank(rule.get("source")), transform)
+
+    filtered.sort(key=sort_key)
+    return filtered
+
+
+def _parse_pad_to_length(text: str) -> int | None:
+    haystack = str(text or "").lower()
+    pads = any(token in haystack for token in ("leading", "pad", "append", "add"))
+    if not pads:
+        return None
+    match = (
+        re.search(r"(\d+)\s*characters?\s*long", haystack)
+        or re.search(r"make it\s*(\d+)", haystack)
+        or re.search(r"pad(?:ded)?(?: with leading zeros?)? to\s*(\d+)", haystack)
+        or re.search(r"(\d+)\s*characters?", haystack)
+    )
+    return int(match.group(1)) if match else None
+
+
 def _resolve_column(field_name: str, columns: list[str]) -> str | None:
+    """Map a stored rule field to a file column for any business object.
+
+    Exact name or declared SAP alias only. Never substring-match a parent
+    field onto a sibling (salesOrder vs salesOrderType, material vs
+    materialType, po vs poItem, …). Uniqueness still uses key == 'X'.
+    """
     target = _norm(field_name)
     if not target:
         return None
-    by_norm = {_norm(c): c for c in columns}
+    by_norm: dict[str, str] = {}
+    for col in columns or []:
+        norm = _norm(col)
+        if norm and norm not in by_norm:
+            by_norm[norm] = col
     if target in by_norm:
         return by_norm[target]
-    for norm, col in by_norm.items():
-        if target in norm or norm in target:
-            return col
     equivalents = _EQUIVALENCE_INDEX.get(target)
     if equivalents:
         for norm, col in by_norm.items():
@@ -186,11 +271,14 @@ def _predefined_rules(field: dict) -> list[dict]:
 
 
 def _is_duplicate_rule(rule: dict) -> bool:
-    text = _rule_text(rule)
+    rule_id = str(rule.get("ruleId") or "")
+    constraint = str(rule.get("constraint") or "")
+    name = str(rule.get("ruleName") or "").strip().lower()
     return (
-        "duplicate" in text
-        or rule.get("ruleId") == "COMMON-DUPLICATE"
-        or rule.get("constraint") in ("UNIQUE_REQUIRED", "FLAG_DUPLICATES")
+        rule_id == "COMMON-DUPLICATE"
+        or constraint in ("UNIQUE_REQUIRED", "FLAG_DUPLICATES")
+        or name == "duplicate check"
+        or name.startswith("duplicate check")
     )
 
 
@@ -442,7 +530,7 @@ def _merge_fields(fields: list[dict]) -> list[dict]:
                 "key": field["key"],
                 "dataType": field.get("dataType", ""),
                 "length": field.get("length", ""),
-                "rules": rules,
+                "rules": _prioritize_field_rules(rules),
             }
         )
     return merged
@@ -506,7 +594,11 @@ def _check_value(rule: dict, value: Any, field: dict | None = None) -> tuple[boo
     if length_match and not empty and len(s) > int(length_match.group(1)):
         return True, f"Length {len(s)} exceeds max {length_match.group(1)}"
 
-    if "leading zero" in text and not empty and re.match(r"^0+\d", s):
+    pad_length = _parse_pad_to_length(text)
+    if pad_length and not empty and s.isdigit() and len(s) < pad_length:
+        return True, f"Length {len(s)} is shorter than {pad_length}; pad with leading zeros"
+
+    if "leading zero" in text and not pad_length and not empty and re.match(r"^0+\d", s):
         return True, "Value has leading zeros"
 
     if ("greater than or equal to zero" in text or "greater than or equal to 0" in text) and not empty:
@@ -548,8 +640,9 @@ def evaluate(rows: list[dict], rules_payload: dict, business_object: str) -> dic
             text = _rule_text(rule)
             severity = "warning" if str(rule.get("severity") or "").lower() == "warning" else "error"
 
-            if "duplicate" in text or rule.get("ruleId") == "COMMON-DUPLICATE":
-                # Duplicate Check only for primary keys (key = "X")
+            if _is_duplicate_rule(rule):
+                # Duplicate uniqueness only when this field is stored as key = "X"
+                # on the loaded validation_rules row (any business object).
                 if field.get("key") != "X":
                     continue
                 affected, samples = _duplicate_rows(rows, column)
@@ -574,10 +667,12 @@ def evaluate(rows: list[dict], rules_payload: dict, business_object: str) -> dic
                     "rule": {
                         "ruleName": rule.get("ruleName"),
                         "source": rule.get("source"),
+                        "type": rule.get("type"),
                         "description": rule.get("description"),
                         "constraint": rule.get("constraint"),
                         "severity": rule.get("severity"),
                         "category": rule.get("category") or "uniqueness",
+                        "ruleId": rule.get("ruleId"),
                     },
                 }
             else:
@@ -616,10 +711,12 @@ def evaluate(rows: list[dict], rules_payload: dict, business_object: str) -> dic
                     "rule": {
                         "ruleName": rule.get("ruleName"),
                         "source": rule.get("source"),
+                        "type": rule.get("type"),
                         "description": rule.get("description"),
                         "constraint": rule.get("constraint"),
                         "severity": rule.get("severity"),
                         "category": rule.get("category"),
+                        "ruleId": rule.get("ruleId"),
                     },
                 }
 
@@ -656,6 +753,11 @@ def evaluate(rows: list[dict], rules_payload: dict, business_object: str) -> dic
             else:
                 group["errorCount"] += finding["affectedCount"]
 
+    for group in field_groups_map.values():
+        group["findings"].sort(
+            key=lambda item: _rule_source_rank((item.get("rule") or {}).get("source"))
+        )
+
     field_groups = sorted(
         field_groups_map.values(),
         key=lambda g: (-g["errorCount"], -g["warningCount"], g["fieldName"]),
@@ -685,6 +787,221 @@ def evaluate(rows: list[dict], rules_payload: dict, business_object: str) -> dic
         },
         "previewRows": rows[:PREVIEW_ROW_LIMIT],
     }
+
+
+def _source_rank(source: Any) -> int:
+    return _rule_source_rank(source)
+
+
+def _infer_transform(finding: dict) -> dict | None:
+    rule = finding.get("rule") or finding
+    text = _rule_text(rule)
+    if _is_duplicate_rule(rule):
+        return {"type": "remove_duplicate_rows", "label": "Remove duplicate key rows (keep first)"}
+    if (
+        rule.get("ruleId") == "COMMON-DATS-FORMAT"
+        or rule.get("constraint") == "SAP_DATS_YYYYMMDD"
+        or "dats" in text
+        or ("yyyymmdd" in text and "date" in text)
+    ):
+        return {"type": "normalize_dats", "label": "Normalize date to SAP DATS YYYYMMDD"}
+    if "trim" in text or rule.get("ruleId") == "COMMON-TRIM":
+        return {"type": "trim_whitespace", "label": "Trim whitespace"}
+    if "uppercase" in text or "upper case" in text:
+        return {"type": "to_uppercase", "label": "Uppercase"}
+    pad_length = _parse_pad_to_length(text)
+    if pad_length:
+        return {"type": "fit_length", "params": {"max": pad_length}, "label": f"Pad/fit length {pad_length}"}
+    if ("leading zero" in text or "leading zeros" in text) and not pad_length:
+        return {"type": "strip_leading_zeros", "label": "Strip leading zeros"}
+    if rule.get("ruleId") == "COMMON-FIELD-LENGTH" or str(rule.get("constraint") or "").startswith("MAX_LENGTH_"):
+        match = re.search(r"(\d+)", str(rule.get("maxLength") or rule.get("constraint") or text))
+        if match:
+            max_len = int(match.group(1))
+            return {"type": "fit_length", "params": {"max": max_len}, "label": f"Fit length {max_len}"}
+    return None
+
+
+def _normalize_dats(value: Any) -> Any:
+    if _empty(value):
+        return value
+    raw = str(value).strip()
+    digits = re.sub(r"\D", "", raw)
+    if re.fullmatch(r"\d{8}", digits):
+        return digits
+    iso = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", raw)
+    if iso:
+        return f"{iso.group(1)}{iso.group(2)}{iso.group(3)}"
+    dmy = re.fullmatch(r"(\d{2})-(\d{2})-(\d{4})", raw)
+    if dmy:
+        return f"{dmy.group(3)}{dmy.group(2)}{dmy.group(1)}"
+    if re.fullmatch(r"\d{7}", digits):
+        return digits.zfill(8)
+    return value
+
+
+def _apply_value(transform: dict, value: Any) -> Any:
+    kind = transform.get("type")
+    if _empty(value) and kind != "remove_duplicate_rows":
+        return value
+    raw = "" if _empty(value) else str(value).strip()
+    if kind == "trim_whitespace":
+        return raw
+    if kind == "to_uppercase":
+        return raw.upper()
+    if kind == "strip_leading_zeros":
+        stripped = re.sub(r"^0+(?=\d)", "", raw)
+        return stripped or "0"
+    if kind == "normalize_dats":
+        return _normalize_dats(value)
+    if kind == "fit_length":
+        max_len = int((transform.get("params") or {}).get("max") or 18)
+        if raw.isdigit():
+            if len(raw) < max_len:
+                raw = raw.zfill(max_len)
+            if len(raw) > max_len:
+                raw = raw[-max_len:]
+            return raw
+        return raw[:max_len] if len(raw) > max_len else raw
+    return value
+
+
+def _remove_duplicate_rows(rows: list[dict], column: str) -> list[dict]:
+    seen: set[str] = set()
+    result: list[dict] = []
+    for row in rows:
+        raw = row.get(column)
+        if _empty(raw):
+            result.append(dict(row))
+            continue
+        key = str(raw).strip().upper()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(dict(row))
+    return result
+
+
+def apply_findings(rows: list[dict], findings: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
+    data = [dict(row) for row in (rows or [])]
+    applied: list[dict] = []
+    skipped: list[dict] = []
+    seen: set[str] = set()
+
+    ordered = sorted(
+        findings or [],
+        key=lambda item: (
+            _source_rank((item.get("rule") or item).get("source")),
+            0 if _is_transformation_rule(item.get("rule") or item) else 1,
+        ),
+    )
+
+    winning_transform: dict[str, int] = {}
+    for finding in ordered:
+        rule = finding.get("rule") or finding
+        if not _is_transformation_rule(rule):
+            continue
+        field_key = str(finding.get("fieldName") or "").upper()
+        rank = _source_rank(rule.get("source"))
+        current = winning_transform.get(field_key)
+        if current is None or rank < current:
+            winning_transform[field_key] = rank
+
+    for finding in ordered:
+        rule = finding.get("rule") or finding
+        field_name = finding.get("fieldName")
+        field_key = str(field_name or "").upper()
+        rank = _source_rank(rule.get("source"))
+        winning = winning_transform.get(field_key)
+        if _is_transformation_rule(rule) and winning is not None and rank > winning:
+            skipped.append(
+                {
+                    "fieldName": field_name,
+                    "ruleName": finding.get("ruleName") or finding.get("ruleViolated"),
+                    "reason": "Skipped because a higher-priority rule already applies to this field",
+                }
+            )
+            continue
+
+        dedupe_key = f"{field_name}::{finding.get('ruleName') or finding.get('ruleViolated')}"
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+
+        transform = _infer_transform(finding)
+        if not transform:
+            skipped.append(
+                {
+                    "fieldName": field_name,
+                    "ruleName": finding.get("ruleName") or finding.get("ruleViolated"),
+                    "reason": "No safe Python transform mapping for this stored rule",
+                }
+            )
+            continue
+
+        column = finding.get("matchedColumn") or _resolve_column(
+            field_name, list(data[0].keys()) if data else []
+        )
+        if not column:
+            skipped.append(
+                {
+                    "fieldName": field_name,
+                    "ruleName": finding.get("ruleName") or finding.get("ruleViolated"),
+                    "reason": f"Could not find column for field {field_name}",
+                }
+            )
+            continue
+
+        if transform["type"] == "remove_duplicate_rows":
+            before = len(data)
+            data = _remove_duplicate_rows(data, column)
+            if len(data) == before:
+                skipped.append(
+                    {
+                        "fieldName": field_name,
+                        "ruleName": finding.get("ruleName") or finding.get("ruleViolated"),
+                        "reason": "No duplicate rows would be removed",
+                    }
+                )
+                continue
+            applied.append(
+                {
+                    "fieldName": field_name,
+                    "ruleName": finding.get("ruleName") or finding.get("ruleViolated"),
+                    "transform": transform["type"],
+                    "source": rule.get("source"),
+                    "affectedCount": before - len(data),
+                }
+            )
+            continue
+
+        changed = 0
+        for row in data:
+            before_value = row.get(column)
+            after_value = _apply_value(transform, before_value)
+            if str(before_value or "") != str(after_value or ""):
+                row[column] = after_value
+                changed += 1
+        if not changed:
+            skipped.append(
+                {
+                    "fieldName": field_name,
+                    "ruleName": finding.get("ruleName") or finding.get("ruleViolated"),
+                    "reason": "Values already satisfy the stored rule",
+                }
+            )
+            continue
+        applied.append(
+            {
+                "fieldName": field_name,
+                "ruleName": finding.get("ruleName") or finding.get("ruleViolated"),
+                "transform": transform["type"],
+                "source": rule.get("source"),
+                "affectedCount": changed,
+            }
+        )
+
+    return data, applied, skipped
 
 
 def handler(event, context=None):
@@ -718,6 +1035,13 @@ def handler(event, context=None):
         }
 
     evaluation = evaluate(rows, rule_set["rules"], business_object)
+    apply_fixes = str(event.get("applyFixes", True)).lower() not in ("false", "0", "no")
+    refined_rows = rows
+    applied_fixes: list[dict] = []
+    skipped_fixes: list[dict] = []
+    if apply_fixes:
+        refined_rows, applied_fixes, skipped_fixes = apply_findings(rows, evaluation["findings"])
+
     return {
         "ok": True,
         "businessObject": business_object,
@@ -727,6 +1051,11 @@ def handler(event, context=None):
             "created_at": rule_set["created_at"],
         },
         **evaluation,
+        "refinedRows": refined_rows,
+        "appliedFixes": applied_fixes,
+        "skippedFixes": skipped_fixes,
+        "fixesApplied": len(applied_fixes),
+        "fixesSkipped": len(skipped_fixes),
     }
 
 

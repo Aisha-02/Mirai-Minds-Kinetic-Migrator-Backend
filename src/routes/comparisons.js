@@ -25,6 +25,12 @@ import {
   updateReportPdfS3Key,
 } from "../models/comparisonReport.js";
 import { compareDatasets } from "../services/comparisonEngine.js";
+import {
+  compareBatchUploadsFromStorage,
+  CompareServiceError,
+  isComparisonServiceEnabled,
+  mapCompareResponseToLegacySummary,
+} from "../services/compareService.js";
 import { generateComparisonReport } from "../services/aiReportService.js";
 import { buildComparisonReportPdf } from "../services/pdfReportService.js";
 import { detectBusinessObject } from "../services/businessObjectDetector.js";
@@ -540,10 +546,54 @@ router.post(
         ? postload.parsed_data
         : [];
 
-      const summary = compareDatasets(preloadRows, postloadRows, {
-        identifierColumns,
-        ...(compareColumns ? { compareColumns } : {}),
-      });
+      let summary;
+      if (isComparisonServiceEnabled()) {
+        if (!preload.storage_path || !postload.storage_path) {
+          return res.status(400).json({
+            error:
+              "Stored upload files are required for Python comparison; re-upload preload and postload",
+          });
+        }
+
+        try {
+          const compareResponse = await compareBatchUploadsFromStorage({
+            preload: {
+              storagePath: preload.storage_path,
+              originalFilename: preload.original_filename,
+            },
+            postload: {
+              storagePath: postload.storage_path,
+              originalFilename: postload.original_filename,
+            },
+            options: {
+              businessObject: batch.business_object || undefined,
+              overrideKeys: identifierColumns,
+              ...(compareColumns ? { compareColumns } : {}),
+            },
+          });
+          summary = mapCompareResponseToLegacySummary(
+            compareResponse,
+            identifierColumns,
+          );
+        } catch (serviceErr) {
+          if (serviceErr instanceof CompareServiceError) {
+            const status =
+              serviceErr.status && serviceErr.status >= 400 && serviceErr.status < 600
+                ? serviceErr.status
+                : 502;
+            return res.status(status).json({
+              error: serviceErr.message,
+              code: serviceErr.code,
+            });
+          }
+          throw serviceErr;
+        }
+      } else {
+        summary = compareDatasets(preloadRows, postloadRows, {
+          identifierColumns,
+          ...(compareColumns ? { compareColumns } : {}),
+        });
+      }
 
       const aiResult = await generateComparisonReport(summary);
 

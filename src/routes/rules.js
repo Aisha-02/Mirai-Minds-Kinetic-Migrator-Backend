@@ -10,6 +10,7 @@ import {
 } from "../models/adminWorkspace.js";
 import {
   createValidationRules,
+  findLatestValidationRulesByBusinessObject,
   findValidationRulesById,
   listValidationRules,
 } from "../models/validationRules.js";
@@ -25,6 +26,7 @@ import {
 } from "../services/s3Service.js";
 import {
   assembleFieldRules,
+  extractCustomRulesByField,
   toPersistableAiRules,
 } from "../services/assembleRules.js";
 
@@ -138,12 +140,21 @@ router.post(
       }
 
       const sourceFields = toBusinessObjectJson(businessObject, fields);
+      const latestRuleSet =
+        await findLatestValidationRulesByBusinessObject(businessObject);
+      const customByField = extractCustomRulesByField(latestRuleSet?.rules);
       const aiByField = await generateAiRulesWithBedrock(
         businessObject,
         sourceFields,
         fields,
+        customByField,
       );
-      const rules = assembleFieldRules(businessObject, fields, aiByField);
+      const rules = assembleFieldRules(
+        businessObject,
+        fields,
+        aiByField,
+        customByField,
+      );
 
       if (sourceSchemaId) {
         const rulesPayload = {

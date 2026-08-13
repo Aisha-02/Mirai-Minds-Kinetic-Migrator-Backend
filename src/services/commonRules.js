@@ -7,6 +7,7 @@
 export const RULE_SOURCE = {
   PREDEFINED: "PREDEFINED",
   AI: "AI",
+  CUSTOM: "CUSTOM",
 };
 
 export const COMMON_RULE_IDS = {

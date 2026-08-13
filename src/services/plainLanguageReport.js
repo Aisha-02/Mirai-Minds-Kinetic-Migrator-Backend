@@ -29,11 +29,11 @@ function humanIssue(finding) {
   const text = `${reason} ${constraint} ${description}`.toLowerCase();
 
   if (text.includes("leading zero")) {
-    return `${field} has leading zeros in ${rowPhrase(count)} — remove leading zeros (or apply the agreed SAP padding format) so values match the material-number standard.`;
+    return `${field} has leading zeros in ${rowPhrase(count)} — remove leading zeros or apply the stored padding rule for this field.`;
   }
 
   if (text.includes("duplicate")) {
-    return `${field} has duplicate values in ${rowPhrase(count)} — primary/key fields must be unique across the preload file; remove or correct the repeated material numbers.`;
+    return `${field} has duplicate values in ${rowPhrase(count)} — only fields marked as primary key (key = X) in validation_rules must be unique; correct or remove repeated values on that key field.`;
   }
 
   const lengthMatch = `${constraint} ${description} ${reason}`.match(

@@ -1,5 +1,5 @@
 import { SUPPORTED_BUSINESS_OBJECTS } from "./sapMetadataService.js";
-import { converseText, mapBedrockError } from "./bedrockClient.js";
+import { converseText } from "./bedrockChatService.js";
 
 const DEFAULT_TIMEOUT_MS = 45_000;
 const DEFAULT_SAMPLE_ROWS = 5;
@@ -80,11 +80,103 @@ function normalizeBusinessObjectLabel(value) {
     .replace(/\s+/g, "_");
 }
 
+function resolveDetectionProvider(explicit) {
+  const value = String(
+    explicit ||
+      process.env.AI_DETECTION_PROVIDER ||
+      process.env.AI_REPORT_PROVIDER ||
+      "bedrock",
+  )
+    .trim()
+    .toLowerCase();
+  return value === "groq" ? "groq" : "bedrock";
+}
+
+function parseDetectionFromModel(content, modelId) {
+  const parsed = extractJsonObject(content);
+  if (!parsed) {
+    return {
+      ok: false,
+      needsManualSelection: true,
+      error: {
+        code: "MALFORMED_RESPONSE",
+        message:
+          "Could not parse a JSON business-object classification from the model response",
+        details: String(content ?? "").slice(0, 300),
+      },
+    };
+  }
+
+  const businessObject = normalizeBusinessObjectLabel(parsed.businessObject);
+  const confidence = normalizeConfidence(parsed.confidence);
+  const reasoning = String(parsed.reasoning ?? "").trim();
+
+  if (!ALLOWED_LABELS.includes(businessObject)) {
+    return {
+      ok: false,
+      needsManualSelection: true,
+      businessObject: "NONE_MATCHED",
+      confidence: "low",
+      reasoning: reasoning || "Model returned an unsupported label",
+      error: {
+        code: "UNSUPPORTED_LABEL",
+        message: `Model returned unsupported business object '${parsed.businessObject}'`,
+      },
+    };
+  }
+
+  const needsManualSelection =
+    businessObject === "NONE_MATCHED" ||
+    !ACCEPTABLE_CONFIDENCE.has(confidence);
+
+  if (needsManualSelection) {
+    return {
+      ok: false,
+      needsManualSelection: true,
+      businessObject,
+      confidence,
+      reasoning,
+      message:
+        "Couldn't auto-detect — please select the business object manually",
+      candidates: [...SUPPORTED_BUSINESS_OBJECTS],
+    };
+  }
+
+  return {
+    ok: true,
+    needsManualSelection: false,
+    businessObject,
+    confidence,
+    reasoning,
+    modelId,
+  };
+}
+
+async function detectWithBedrock(input, options = {}) {
+  const prompt = buildDetectionPrompt(input);
+  const result = await converseText(prompt, options);
+
+  if (!result.ok) {
+    return {
+      ok: false,
+      needsManualSelection: true,
+      error: result.error,
+      candidates: [...SUPPORTED_BUSINESS_OBJECTS],
+      message:
+        "Couldn't auto-detect — please select the business object manually",
+    };
+  }
+
+  return parseDetectionFromModel(result.text, result.modelId);
+}
+
 /**
  * @param {{ columns: string[], sampleRows?: Record<string, unknown>[] }} input
  * @param {{
  *   modelId?: string,
  *   timeoutMs?: number,
+ *   fetchImpl?: typeof fetch,
+ *   provider?: 'groq' | 'bedrock',
  * }} [options]
  */
 export async function detectBusinessObject(input, options = {}) {
@@ -106,6 +198,14 @@ export async function detectBusinessObject(input, options = {}) {
     };
   }
 
+  const provider = resolveDetectionProvider(options.provider);
+  if (provider === "bedrock") {
+    return detectWithBedrock({ columns, sampleRows }, options);
+  }
+
+  const apiKey = (options.apiKey || process.env.GROQ_API_KEY || "").trim();
+  const modelId =
+    options.modelId || process.env.GROQ_MODEL_ID || DEFAULT_MODEL;
   const timeoutMs = Number(
     options.timeoutMs ?? process.env.BEDROCK_TIMEOUT_MS ?? DEFAULT_TIMEOUT_MS,
   );
@@ -119,63 +219,35 @@ export async function detectBusinessObject(input, options = {}) {
       timeoutMs,
     });
 
-    const parsed = extractJsonObject(text);
-    if (!parsed) {
+    const bodyText = await response.text();
+    if (!response.ok) {
+      return {
+        ok: false,
+        needsManualSelection: true,
+        error: {
+          code: response.status === 429 ? "THROTTLED" : "GROQ_ERROR",
+          message: `Business object detection failed (HTTP ${response.status})`,
+          details: bodyText.slice(0, 300),
+        },
+      };
+    }
+
+    let payload;
+    try {
+      payload = JSON.parse(bodyText);
+    } catch {
       return {
         ok: false,
         needsManualSelection: true,
         error: {
           code: "MALFORMED_RESPONSE",
-          message:
-            "Could not parse a JSON business-object classification from the model response",
-          details: String(text ?? "").slice(0, 300),
+          message: "Groq returned a non-JSON envelope for detection",
         },
       };
     }
 
-    const businessObject = normalizeBusinessObjectLabel(parsed.businessObject);
-    const confidence = normalizeConfidence(parsed.confidence);
-    const reasoning = String(parsed.reasoning ?? "").trim();
-
-    if (!ALLOWED_LABELS.includes(businessObject)) {
-      return {
-        ok: false,
-        needsManualSelection: true,
-        businessObject: "NONE_MATCHED",
-        confidence: "low",
-        reasoning: reasoning || "Model returned an unsupported label",
-        error: {
-          code: "UNSUPPORTED_LABEL",
-          message: `Model returned unsupported business object '${parsed.businessObject}'`,
-        },
-      };
-    }
-
-    const needsManualSelection =
-      businessObject === "NONE_MATCHED" ||
-      !ACCEPTABLE_CONFIDENCE.has(confidence);
-
-    if (needsManualSelection) {
-      return {
-        ok: false,
-        needsManualSelection: true,
-        businessObject,
-        confidence,
-        reasoning,
-        message:
-          "Couldn't auto-detect — please select the business object manually",
-        candidates: [...SUPPORTED_BUSINESS_OBJECTS],
-      };
-    }
-
-    return {
-      ok: true,
-      needsManualSelection: false,
-      businessObject,
-      confidence,
-      reasoning,
-      modelId,
-    };
+    const content = payload?.choices?.[0]?.message?.content;
+    return parseDetectionFromModel(content, modelId);
   } catch (err) {
     const mapped = err?.code ? err : mapBedrockError(err);
     const code = mapped.code || "BEDROCK_ERROR";

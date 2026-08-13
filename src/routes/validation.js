@@ -14,20 +14,11 @@ import {
 import { requireAuth, requireRole } from "../middleware/auth.js";
 import { detectBusinessObject } from "../services/businessObjectDetector.js";
 import { runValidationRulesLambda } from "../services/lambdaValidationRunner.js";
+import { SUPPORTED_BUSINESS_OBJECTS } from "../services/sapMetadataService.js";
 import {
-  SUPPORTED_BUSINESS_OBJECTS,
-  mapPreloadToSapFields,
-} from "../services/sapMetadataService.js";
-import { findValidationRulesById } from "../models/validationRules.js";
-import {
-  createCleanupSession,
-  findCleanupSessionForUser,
-  toPublicCleanupSession,
-  updateCleanupSession,
-} from "../models/validationCleanupSession.js";
-import { runValidationAutoFix } from "../services/validationAutoFixService.js";
-import { alignValidationOutputToSapFields } from "../services/validationColumnMapping.js";
-import { remapRowsToPreloadColumns, remapRowsToSapColumns } from "../constants/fieldColumnAliases.js";
+  isS3StorageEnabled,
+  uploadValidationArtifacts,
+} from "../services/s3StorageService.js";
 
 const router = Router();
 
@@ -213,6 +204,27 @@ router.post(
         summary: lambdaResult.summary,
       });
 
+      const reportPayload = {
+        ...lambdaResult.report,
+        filename: req.file.originalname,
+        totalRows: rows.length,
+        detection,
+        rulesBusinessObject,
+        summary: lambdaResult.summary,
+      };
+
+      let s3Artifacts = null;
+      if (isS3StorageEnabled()) {
+        const sessionKey = `${Date.now()}-${rulesBusinessObject}`;
+        s3Artifacts = await uploadValidationArtifacts({
+          userId: req.user.id,
+          sessionKey,
+          originalFilename: req.file.originalname,
+          fileBuffer: req.file.buffer,
+          reportJson: reportPayload,
+        });
+      }
+
       return res.status(200).json({
         sessionId: session.id,
         filename: req.file.originalname,
@@ -225,23 +237,18 @@ router.post(
         rulesBusinessObject,
         ruleSet: lambdaResult.ruleSet,
         summary: lambdaResult.summary,
-        findings: aligned.findings,
-        report: {
-          ...aligned.report,
-          filename: req.file.originalname,
-          totalRows: mappedRows.length,
-          columnMapping,
-          originalColumns,
-          sapColumns: columns,
-          sapFieldNames,
-          sapMetadataUsed: sapMapping.sapMetadataUsed,
-        },
-        previewRows: remapRowsToPreloadColumns(
-          mappedRows.slice(0, 20),
-          columnMapping,
-          originalColumns,
-        ),
+        findings: lambdaResult.findings,
+        report: reportPayload,
+        previewRows: lambdaResult.previewRows || rows.slice(0, 20),
         evaluator: String(process.env.VALIDATION_LAMBDA_MODE || "local"),
+        ...(s3Artifacts
+          ? {
+              storage: {
+                input: s3Artifacts.input.uri,
+                validation_report: s3Artifacts.report.uri,
+              },
+            }
+          : {}),
       });
     } catch (err) {
       return next(err);

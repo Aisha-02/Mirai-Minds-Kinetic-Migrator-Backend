@@ -25,7 +25,7 @@ import {
   markReportProcessing,
   toPublicReport,
 } from "../models/comparisonReport.js";
-import { compareDatasets } from "../services/comparisonEngine.js";
+import { runComparison } from "../services/comparisonRunner.js";
 import { generateComparisonReport } from "../services/aiReportService.js";
 import { buildComparisonReportPdf } from "../services/pdfReportService.js";
 import { detectBusinessObject } from "../services/businessObjectDetector.js";
@@ -42,6 +42,10 @@ import {
   parseUploadedFile,
   removeFileQuietly,
 } from "../lib/uploadParse.js";
+import {
+  isS3StorageEnabled,
+  uploadOriginalFile,
+} from "../services/s3StorageService.js";
 
 const router = Router();
 
@@ -51,6 +55,36 @@ const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 ensureUploadDir(UPLOADS_ROOT);
+
+async function persistUploadedFile({
+  userId,
+  batchId,
+  fileType,
+  originalFilename,
+  tempPath,
+}) {
+  if (isS3StorageEnabled()) {
+    const { uri } = await uploadOriginalFile({
+      userId,
+      batchId,
+      fileType,
+      originalFilename,
+      filePath: tempPath,
+    });
+    removeFileQuietly(tempPath);
+    return uri;
+  }
+
+  const finalPath = buildStoragePath({
+    userId,
+    batchId,
+    fileType,
+    originalFilename,
+  });
+  ensureUploadDir(path.dirname(finalPath));
+  fs.renameSync(tempPath, finalPath);
+  return finalPath;
+}
 
 async function resolveAccessibleBatch(req, batchId) {
   if (req.user.role === "admin") {
@@ -227,7 +261,7 @@ async function resolveBusinessObjectForPreload(parsedData, reqBody) {
 
 async function handleUpload(fileType, req, res, next) {
   let tempPath = req.file?.path ?? null;
-  let finalPath = null;
+  let storagePath = null;
   let client = null;
 
   try {
@@ -383,14 +417,13 @@ async function handleUpload(fileType, req, res, next) {
       }
     }
 
-    finalPath = buildStoragePath({
+    storagePath = await persistUploadedFile({
       userId,
       batchId,
       fileType,
       originalFilename: req.file.originalname,
+      tempPath,
     });
-    ensureUploadDir(path.dirname(finalPath));
-    fs.renameSync(tempPath, finalPath);
     tempPath = null;
 
     const uploadRow = await createFileUpload(client, {
@@ -398,7 +431,7 @@ async function handleUpload(fileType, req, res, next) {
       batchId,
       fileType,
       originalFilename: req.file.originalname,
-      storagePath: finalPath,
+      storagePath,
       parsedData,
     });
 
@@ -428,10 +461,16 @@ async function handleUpload(fileType, req, res, next) {
       };
     }
 
+    if (storagePath) {
+      response.storage_path = storagePath;
+    }
+
     return res.status(201).json(response);
   } catch (err) {
     removeFileQuietly(tempPath);
-    removeFileQuietly(finalPath);
+    if (storagePath && !isS3StorageEnabled()) {
+      removeFileQuietly(storagePath);
+    }
     if (client) {
       try {
         await client.query("ROLLBACK");
@@ -546,17 +585,28 @@ router.post(
       }
       reportId = report.id;
 
-      const preloadRows = Array.isArray(preload.parsed_data)
-        ? preload.parsed_data
-        : [];
-      const postloadRows = Array.isArray(postload.parsed_data)
-        ? postload.parsed_data
-        : [];
+      let comparisonResult;
+      try {
+        comparisonResult = await runComparison({
+          batchId,
+          preload,
+          postload,
+          identifierColumns,
+          compareColumns,
+        });
+      } catch (err) {
+        const failed = await failReport(db, {
+          reportId,
+          errorMessage:
+            err?.message || "Comparison failed before report generation",
+        });
+        return res.status(err?.status === 504 ? 504 : 502).json({
+          error: failed.error_message || "Comparison failed",
+          report: toPublicReport(failed),
+        });
+      }
 
-      const summary = compareDatasets(preloadRows, postloadRows, {
-        identifierColumns,
-        ...(compareColumns ? { compareColumns } : {}),
-      });
+      const summary = comparisonResult.summary;
 
       const aiResult = await generateComparisonReport(summary);
 
@@ -586,6 +636,10 @@ router.post(
         report: toPublicReport(completed),
         provider: aiResult.provider,
         model_id: aiResult.modelId,
+        comparison_evaluator: comparisonResult.evaluator,
+        ...(comparisonResult.fallbackReason
+          ? { comparison_fallback_reason: comparisonResult.fallbackReason }
+          : {}),
       });
     } catch (err) {
       if (reportId) {

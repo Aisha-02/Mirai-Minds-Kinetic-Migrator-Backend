@@ -1,14 +1,6 @@
-import fs from "fs";
 import path from "path";
-import { fileURLToPath } from "url";
 import { parse as parseCsv } from "csv-parse/sync";
 import * as XLSX from "xlsx";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-export const UPLOADS_ROOT = path.resolve(
-  process.env.UPLOAD_DIR || path.join(__dirname, "..", "..", "uploads"),
-);
 
 const ALLOWED_EXTENSIONS = new Set([".csv", ".xlsx"]);
 
@@ -87,46 +79,6 @@ export function parseUploadedBuffer(buffer, originalFilename) {
   throw err;
 }
 
-export function parseUploadedFile(filePath, originalFilename) {
-  const ext = getFileExtension(originalFilename);
-
-  if (ext === ".csv") {
-    return parseCsvText(fs.readFileSync(filePath, "utf8"));
-  }
-
-  if (ext === ".xlsx") {
-    const workbook = XLSX.readFile(filePath, { cellDates: true });
-    return parseXlsxWorkbook(workbook);
-  }
-
-  const err = new Error("Only .csv and .xlsx files are allowed");
-  err.status = 400;
-  throw err;
-}
-
-export function ensureUploadDir(dirPath) {
-  fs.mkdirSync(dirPath, { recursive: true });
-}
-
-export function removeFileQuietly(filePath) {
-  if (!filePath) return;
-  try {
-    fs.unlinkSync(filePath);
-  } catch {
-    // ignore cleanup failures
-  }
-}
-
-export function buildStoragePath({ userId, batchId, fileType, originalFilename }) {
-  const ext = getFileExtension(originalFilename) || ".bin";
-  const safeBase = path
-    .basename(originalFilename, ext)
-    .replace(/[^a-zA-Z0-9._-]+/g, "_")
-    .slice(0, 80);
-  const filename = `${fileType}-${Date.now()}-${safeBase}${ext}`;
-  return path.join(UPLOADS_ROOT, String(userId), String(batchId), filename);
-}
-
 export function buildRefinedFilename(originalFilename) {
   const ext = getFileExtension(originalFilename) || ".xlsx";
   return `preload_refined${ext}`;
@@ -164,4 +116,10 @@ export function serializeRowsToBuffer(rows, originalFilename) {
   return Buffer.from(
     XLSX.write(workbook, { type: "buffer", bookType: "xlsx" }),
   );
+}
+
+export function contentTypeForFilename(filename) {
+  return getFileExtension(filename) === ".csv"
+    ? "text/csv; charset=utf-8"
+    : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 }

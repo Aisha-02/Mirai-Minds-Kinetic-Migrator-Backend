@@ -1,6 +1,5 @@
+import { randomUUID } from "node:crypto";
 import { Router } from "express";
-import fs from "node:fs/promises";
-import path from "node:path";
 import multer from "multer";
 import { query } from "../db.js";
 import { requireAuth, requireRole } from "../middleware/auth.js";
@@ -10,32 +9,19 @@ import {
   findTransformationDocumentById,
   listTransformationDocuments,
 } from "../models/transformationDocument.js";
+import {
+  assertS3Configured,
+  buildSignedDownloadResponse,
+  buildTransformationDocKey,
+  deleteFile,
+  uploadFile,
+} from "../services/s3Service.js";
 
 const router = Router();
 const db = { query };
 
-const UPLOAD_ROOT = path.resolve(
-  process.env.UPLOAD_DIR || path.join(process.cwd(), "uploads"),
-  "transformation-documents",
-);
-
 const upload = multer({
-  storage: multer.diskStorage({
-    destination: async (_req, _file, cb) => {
-      try {
-        await fs.mkdir(UPLOAD_ROOT, { recursive: true });
-        cb(null, UPLOAD_ROOT);
-      } catch (err) {
-        cb(err);
-      }
-    },
-    filename: (_req, file, cb) => {
-      const safe = String(file.originalname || "document")
-        .replace(/[^\w.\-()+\s]/g, "_")
-        .slice(0, 180);
-      cb(null, `${Date.now()}-${safe}`);
-    },
-  }),
+  storage: multer.memoryStorage(),
   limits: {
     fileSize: Number(process.env.UPLOAD_MAX_BYTES || 5 * 1024 * 1024),
   },
@@ -68,6 +54,8 @@ router.post(
   upload.single("file"),
   async (req, res, next) => {
     try {
+      assertS3Configured();
+
       const label = String(req.body?.label || "").trim();
       const category = String(req.body?.category || "").trim();
 
@@ -79,15 +67,28 @@ router.post(
           error: `category must be one of: ${[...ALLOWED_CATEGORIES].join(", ")}`,
         });
       }
-      if (!req.file) {
+      if (!req.file?.buffer) {
         return res.status(400).json({ error: "file is required" });
       }
 
+      const documentId = randomUUID();
+      const s3Key = buildTransformationDocKey({
+        documentId,
+        originalFilename: req.file.originalname,
+      });
+
+      await uploadFile({
+        key: s3Key,
+        body: req.file.buffer,
+        contentType: req.file.mimetype || "application/octet-stream",
+      });
+
       const saved = await createTransformationDocument(db, {
+        id: documentId,
         label,
         category,
         originalFilename: req.file.originalname,
-        storagePath: req.file.path,
+        storagePath: s3Key,
         mimeType: req.file.mimetype,
         fileSize: req.file.size,
         uploadedBy: req.user.id,
@@ -111,26 +112,15 @@ router.get(
         return res.status(404).json({ error: "Document not found" });
       }
 
-      const filePath = path.resolve(doc.storage_path);
-      if (!filePath.startsWith(UPLOAD_ROOT)) {
-        return res.status(400).json({ error: "Invalid document path" });
+      if (!doc.storage_path) {
+        return res.status(404).json({ error: "Document file is missing" });
       }
 
-      try {
-        await fs.access(filePath);
-      } catch {
-        return res.status(404).json({ error: "Document file is missing on server" });
-      }
-
-      res.setHeader(
-        "Content-Disposition",
-        `attachment; filename="${doc.original_filename}"`,
+      const payload = await buildSignedDownloadResponse(
+        doc.storage_path,
+        doc.original_filename,
       );
-      if (doc.mime_type) {
-        res.setHeader("Content-Type", doc.mime_type);
-      }
-
-      return res.sendFile(filePath);
+      return res.status(200).json(payload);
     } catch (err) {
       return next(err);
     }
@@ -149,7 +139,7 @@ router.delete(
       }
 
       try {
-        await fs.unlink(removed.storage_path);
+        await deleteFile(removed.storage_path);
       } catch {
         // file may already be gone
       }

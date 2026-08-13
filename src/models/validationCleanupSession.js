@@ -66,12 +66,19 @@ export async function updateCleanupSession(sessionId, patch) {
     summary: "summary",
     pendingProposal: "pending_proposal",
     chatMessages: "chat_messages",
+    refinedS3Key: "refined_s3_key",
+    refinedFilename: "refined_filename",
   };
 
   for (const [key, column] of Object.entries(map)) {
     if (Object.prototype.hasOwnProperty.call(patch, key)) {
-      fields.push(`${column} = $${i}::jsonb`);
-      values.push(JSON.stringify(patch[key]));
+      if (key === "refinedS3Key" || key === "refinedFilename") {
+        fields.push(`${column} = $${i}`);
+        values.push(patch[key]);
+      } else {
+        fields.push(`${column} = $${i}::jsonb`);
+        values.push(JSON.stringify(patch[key]));
+      }
       i += 1;
     }
   }

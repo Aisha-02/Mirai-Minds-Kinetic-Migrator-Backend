@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS comparison_reports (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   completed_at TIMESTAMPTZ,
   error_message TEXT,
+  pdf_s3_key TEXT,
   CONSTRAINT comparison_reports_batch_id_unique UNIQUE (batch_id)
 );
 
@@ -109,6 +110,8 @@ CREATE TABLE IF NOT EXISTS validation_cleanup_sessions (
   summary JSONB,
   pending_proposal JSONB,
   chat_messages JSONB NOT NULL DEFAULT '[]'::jsonb,
+  refined_s3_key TEXT,
+  refined_filename TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

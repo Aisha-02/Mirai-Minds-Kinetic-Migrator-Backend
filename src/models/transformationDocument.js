@@ -20,6 +20,7 @@ export async function findTransformationDocumentById(db, id) {
 export async function createTransformationDocument(
   db,
   {
+    id,
     label,
     category,
     originalFilename,
@@ -31,11 +32,12 @@ export async function createTransformationDocument(
 ) {
   const result = await db.query(
     `INSERT INTO transformation_documents (
-       label, category, original_filename, storage_path, mime_type, file_size, uploaded_by
+       id, label, category, original_filename, storage_path, mime_type, file_size, uploaded_by
      )
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      RETURNING id, label, category, original_filename, mime_type, file_size, created_at`,
     [
+      id,
       label,
       category,
       originalFilename,

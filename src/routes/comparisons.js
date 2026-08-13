@@ -1,5 +1,3 @@
-import fs from "fs";
-import path from "path";
 import { Router } from "express";
 import multer from "multer";
 import { requireAuth, requireRole } from "../middleware/auth.js";
@@ -24,6 +22,7 @@ import {
   findReportByBatchId,
   markReportProcessing,
   toPublicReport,
+  updateReportPdfS3Key,
 } from "../models/comparisonReport.js";
 import { compareDatasets } from "../services/comparisonEngine.js";
 import { generateComparisonReport } from "../services/aiReportService.js";
@@ -35,12 +34,15 @@ import {
 } from "../services/sapMetadataService.js";
 import { validateColumnsAgainstSchema } from "../services/schemaValidation.js";
 import {
-  UPLOADS_ROOT,
-  buildStoragePath,
-  ensureUploadDir,
+  assertS3Configured,
+  buildComparisonReportKey,
+  buildComparisonUploadKey,
+  buildSignedDownloadResponse,
+  uploadFile,
+} from "../services/s3Service.js";
+import {
   isAllowedUploadFilename,
-  parseUploadedFile,
-  removeFileQuietly,
+  parseUploadedBuffer,
 } from "../lib/uploadParse.js";
 
 const router = Router();
@@ -50,7 +52,21 @@ const db = { query };
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-ensureUploadDir(UPLOADS_ROOT);
+async function uploadComparisonPdfToS3({ batchId, summaryJson, aiReportText, generatedAt }) {
+  const pdfBuffer = await buildComparisonReportPdf({
+    batchId,
+    summaryJson,
+    aiReportText,
+    generatedAt,
+  });
+  const pdfKey = buildComparisonReportKey({ batchId });
+  await uploadFile({
+    key: pdfKey,
+    body: pdfBuffer,
+    contentType: "application/pdf",
+  });
+  return pdfKey;
+}
 
 async function resolveAccessibleBatch(req, batchId) {
   if (req.user.role === "admin") {
@@ -63,24 +79,7 @@ async function resolveAccessibleBatch(req, batchId) {
 }
 
 const upload = multer({
-  storage: multer.diskStorage({
-    destination(_req, _file, cb) {
-      const dest = path.join(UPLOADS_ROOT, "_tmp");
-      try {
-        ensureUploadDir(dest);
-        cb(null, dest);
-      } catch (err) {
-        cb(err);
-      }
-    },
-    filename(_req, file, cb) {
-      const safe = String(file.originalname || "upload").replace(
-        /[^a-zA-Z0-9._-]+/g,
-        "_",
-      );
-      cb(null, `${Date.now()}-${safe}`);
-    },
-  }),
+  storage: multer.memoryStorage(),
   limits: { fileSize: maxBytes, files: 1 },
   fileFilter(_req, file, cb) {
     if (!isAllowedUploadFilename(file.originalname)) {
@@ -226,34 +225,30 @@ async function resolveBusinessObjectForPreload(parsedData, reqBody) {
 }
 
 async function handleUpload(fileType, req, res, next) {
-  let tempPath = req.file?.path ?? null;
-  let finalPath = null;
   let client = null;
 
   try {
-    if (!req.file) {
+    assertS3Configured();
+
+    if (!req.file?.buffer) {
       return res.status(400).json({ error: "A file is required (field name: file)" });
     }
 
     if (!isAllowedUploadFilename(req.file.originalname)) {
-      removeFileQuietly(tempPath);
       return res.status(400).json({ error: "Only .csv and .xlsx files are allowed" });
     }
 
     const userId = req.user.id;
 
-    // Parse while still in temp storage so preload detection can run before DB writes
     let parsedData;
     try {
-      parsedData = parseUploadedFile(tempPath, req.file.originalname);
+      parsedData = parseUploadedBuffer(req.file.buffer, req.file.originalname);
     } catch (parseErr) {
-      removeFileQuietly(tempPath);
       parseErr.status = parseErr.status || 400;
       return next(parseErr);
     }
 
     if (!Array.isArray(parsedData) || parsedData.length === 0) {
-      removeFileQuietly(tempPath);
       return res.status(400).json({ error: "File contains no data rows" });
     }
 
@@ -263,7 +258,6 @@ async function handleUpload(fileType, req, res, next) {
     if (fileType === "preload") {
       const resolved = await resolveBusinessObjectForPreload(parsedData, req.body);
       if (!resolved.ok) {
-        removeFileQuietly(tempPath);
         return res.status(422).json({
           needs_business_object: true,
           error: resolved.message,
@@ -278,7 +272,6 @@ async function handleUpload(fileType, req, res, next) {
         `[preload] sap metadata ok=${metadata.ok} object=${resolved.businessObject} cached=${metadata.cached ?? false} keys=${metadata.ok ? metadata.identifierColumns?.join(",") : metadata.error?.code}`,
       );
       if (!metadata.ok) {
-        removeFileQuietly(tempPath);
         return res.status(502).json({
           error: "Failed to load SAP metadata for the detected business object",
           sap_error: metadata.error,
@@ -289,10 +282,7 @@ async function handleUpload(fileType, req, res, next) {
       const columns = collectColumns(parsedData);
       const validation = validateColumnsAgainstSchema(columns, metadata.fields);
 
-      // Hard-fail only when SAP key fields are absent — comparison cannot match rows.
-      // Extra/missing non-key columns are warnings (files are often partial extracts).
       if (!validation.ok) {
-        removeFileQuietly(tempPath);
         return res.status(400).json({
           error:
             validation.identifierColumns.length === 0
@@ -335,14 +325,12 @@ async function handleUpload(fileType, req, res, next) {
           userId,
         });
         if (!batch) {
-          removeFileQuietly(tempPath);
           return res.status(404).json({ error: "Batch not found" });
         }
         batchId = batch.id;
       } else {
         const openBatch = await findOpenBatchForUser(userId);
         if (!openBatch) {
-          removeFileQuietly(tempPath);
           return res.status(400).json({
             error:
               "No open preload batch found; upload a preload file first or pass batch_id",
@@ -362,7 +350,6 @@ async function handleUpload(fileType, req, res, next) {
         await client.query("ROLLBACK");
         client.release();
         client = null;
-        removeFileQuietly(tempPath);
         return res.status(400).json({
           error: "This batch has no preload file; upload preload first",
         });
@@ -376,29 +363,31 @@ async function handleUpload(fileType, req, res, next) {
         await client.query("ROLLBACK");
         client.release();
         client = null;
-        removeFileQuietly(tempPath);
         return res.status(409).json({
           error: "This batch already has a postload file",
         });
       }
     }
 
-    finalPath = buildStoragePath({
+    const s3Key = buildComparisonUploadKey({
       userId,
       batchId,
       fileType,
       originalFilename: req.file.originalname,
     });
-    ensureUploadDir(path.dirname(finalPath));
-    fs.renameSync(tempPath, finalPath);
-    tempPath = null;
+
+    await uploadFile({
+      key: s3Key,
+      body: req.file.buffer,
+      contentType: req.file.mimetype || "application/octet-stream",
+    });
 
     const uploadRow = await createFileUpload(client, {
       userId,
       batchId,
       fileType,
       originalFilename: req.file.originalname,
-      storagePath: finalPath,
+      storagePath: s3Key,
       parsedData,
     });
 
@@ -430,8 +419,6 @@ async function handleUpload(fileType, req, res, next) {
 
     return res.status(201).json(response);
   } catch (err) {
-    removeFileQuietly(tempPath);
-    removeFileQuietly(finalPath);
     if (client) {
       try {
         await client.query("ROLLBACK");
@@ -576,11 +563,23 @@ router.post(
         });
       }
 
-      const completed = await completeReport(db, {
+      let completed = await completeReport(db, {
         reportId,
         summaryJson: summary,
         aiReportText: aiResult.reportText,
       });
+
+      try {
+        const pdfKey = await uploadComparisonPdfToS3({
+          batchId,
+          summaryJson: summary,
+          aiReportText: aiResult.reportText,
+          generatedAt: completed.completed_at || completed.created_at || new Date(),
+        });
+        completed = await updateReportPdfS3Key(db, { reportId, pdfS3Key: pdfKey });
+      } catch (pdfErr) {
+        console.error("[comparisons] PDF upload to S3 failed:", pdfErr.message);
+      }
 
       return res.status(200).json({
         report: toPublicReport(completed),
@@ -713,24 +712,21 @@ router.get(
         });
       }
 
-      // On-demand PDF: no download/cache pattern exists in this project, and
-      // reports can be re-run (summary/narrative change), so we build from
-      // current DB fields each request instead of storing a PDF blob.
-      const pdfBuffer = await buildComparisonReportPdf({
-        batchId,
-        summaryJson: report.summary_json,
-        aiReportText: report.ai_report_text,
-        generatedAt: report.completed_at || report.created_at || new Date(),
-      });
-
       const filename = `comparison-report-${batchId}.pdf`;
-      res.setHeader("Content-Type", "application/pdf");
-      res.setHeader(
-        "Content-Disposition",
-        `attachment; filename="${filename}"`,
-      );
-      res.setHeader("Content-Length", pdfBuffer.length);
-      return res.status(200).send(pdfBuffer);
+      let pdfKey = report.pdf_s3_key;
+
+      if (!pdfKey) {
+        pdfKey = await uploadComparisonPdfToS3({
+          batchId,
+          summaryJson: report.summary_json,
+          aiReportText: report.ai_report_text,
+          generatedAt: report.completed_at || report.created_at || new Date(),
+        });
+        await updateReportPdfS3Key(db, { reportId: report.id, pdfS3Key: pdfKey });
+      }
+
+      const payload = await buildSignedDownloadResponse(pdfKey, filename);
+      return res.status(200).json(payload);
     } catch (err) {
       return next(err);
     }

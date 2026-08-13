@@ -7,6 +7,7 @@ import {
 import { BUSINESS_OBJECTS, isBusinessObject } from "../constants/businessObjects.js";
 import {
   buildRefinedFilename,
+  contentTypeForFilename,
   isAllowedUploadFilename,
   parseUploadedBuffer,
   serializeRowsToBuffer,
@@ -26,6 +27,11 @@ import {
   updateCleanupSession,
 } from "../models/validationCleanupSession.js";
 import { runValidationAutoFix } from "../services/validationAutoFixService.js";
+import {
+  buildRefinedValidationKey,
+  buildSignedDownloadResponse,
+  uploadFile,
+} from "../services/s3Service.js";
 import { alignValidationOutputToSapFields } from "../services/validationColumnMapping.js";
 import { remapRowsToPreloadColumns, remapRowsToSapColumns } from "../constants/fieldColumnAliases.js";
 
@@ -54,6 +60,32 @@ function collectColumns(rows) {
     }
   }
   return [...columns];
+}
+
+async function uploadRefinedValidationFile(session, refinedRows) {
+  const refinedFilename =
+    session.report?.autoFix?.refinedFilename ||
+    buildRefinedFilename(session.filename);
+
+  const exportRows = remapRowsToSapColumns(
+    refinedRows,
+    session.report?.columnMapping || {},
+    session.report?.sapFieldNames || session.report?.sapColumns || [],
+  );
+
+  const buffer = serializeRowsToBuffer(exportRows, session.filename);
+  const refinedKey = buildRefinedValidationKey({
+    sessionId: session.id,
+    filename: refinedFilename,
+  });
+
+  await uploadFile({
+    key: refinedKey,
+    body: buffer,
+    contentType: contentTypeForFilename(refinedFilename),
+  });
+
+  return { refinedKey, refinedFilename };
 }
 
 /**
@@ -299,6 +331,19 @@ router.post(
         report: updatedReport,
       });
 
+      try {
+        const { refinedKey, refinedFilename } = await uploadRefinedValidationFile(
+          { ...session, report: updatedReport },
+          autoFix.refinedRows,
+        );
+        await updateCleanupSession(session.id, {
+          refinedS3Key: refinedKey,
+          refinedFilename,
+        });
+      } catch (uploadErr) {
+        console.error("[validation] refined file upload failed:", uploadErr.message);
+      }
+
       return res.status(200).json({
         sessionId: session.id,
         ok: true,
@@ -343,27 +388,24 @@ router.get(
         return res.status(400).json({ error: "No refined data available" });
       }
 
-      const refinedFilename =
+      let refinedKey = session.refined_s3_key;
+      let refinedFilename =
+        session.refined_filename ||
         session.report?.autoFix?.refinedFilename ||
         buildRefinedFilename(session.filename);
 
-      const exportRows = remapRowsToSapColumns(
-        refinedRows,
-        session.report?.columnMapping || {},
-        session.report?.sapFieldNames || session.report?.sapColumns || [],
-      );
+      if (!refinedKey) {
+        const uploaded = await uploadRefinedValidationFile(session, refinedRows);
+        refinedKey = uploaded.refinedKey;
+        refinedFilename = uploaded.refinedFilename;
+        await updateCleanupSession(session.id, {
+          refinedS3Key: refinedKey,
+          refinedFilename,
+        });
+      }
 
-      const buffer = serializeRowsToBuffer(exportRows, session.filename);
-      const contentType = refinedFilename.endsWith(".csv")
-        ? "text/csv; charset=utf-8"
-        : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
-
-      res.setHeader("Content-Type", contentType);
-      res.setHeader(
-        "Content-Disposition",
-        `attachment; filename="${refinedFilename}"`,
-      );
-      return res.send(buffer);
+      const payload = await buildSignedDownloadResponse(refinedKey, refinedFilename);
+      return res.status(200).json(payload);
     } catch (err) {
       return next(err);
     }

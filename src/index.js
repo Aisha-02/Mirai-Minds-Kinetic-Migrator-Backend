@@ -2,6 +2,7 @@ import "dotenv/config";
 import cors from "cors";
 import express from "express";
 import authRoutes from "./routes/auth.js";
+import adminRoutes from "./routes/admin.js";
 import comparisonRoutes from "./routes/comparisons.js";
 import rulesRoutes from "./routes/rules.js";
 import validationRoutes from "./routes/validation.js";
@@ -29,6 +30,7 @@ app.get("/health", (_req, res) => {
 });
 
 app.use("/api/auth", authRoutes);
+app.use("/api/admin", adminRoutes);
 app.use("/api/comparisons", comparisonRoutes);
 app.use("/api/rules", rulesRoutes);
 app.use("/api/validation", validationRoutes);
@@ -51,5 +53,8 @@ app.listen(port, () => {
   );
   console.log(
     `Bedrock: region=${process.env.BEDROCK_REGION || process.env.AWS_REGION || "MISSING"} model=${process.env.BEDROCK_MODEL_ID || "MISSING"} credentials=${process.env.AWS_BEARER_TOKEN_BEDROCK || process.env.AWS_ACCESS_KEY_ID ? "set" : "MISSING"}`,
+  );
+  console.log(
+    `S3: bucket=${process.env.AWS_S3_BUCKET || "MISSING — file uploads will fail"}`,
   );
 });

@@ -3,6 +3,12 @@ import multer from "multer";
 import { BUSINESS_OBJECTS, isBusinessObject } from "../constants/businessObjects.js";
 import { requireAuth } from "../middleware/auth.js";
 import {
+  findRulesDraft,
+  findSourceSchemaByIdForUser,
+  upsertRulesDraft,
+  upsertWorkspaceState,
+} from "../models/adminWorkspace.js";
+import {
   createValidationRules,
   findValidationRulesById,
   listValidationRules,
@@ -13,6 +19,10 @@ import {
 } from "../services/excelParser.js";
 import { validateFieldMetadata } from "../services/excelValidator.js";
 import { generateAiRulesWithBedrock } from "../services/bedrockRules.js";
+import {
+  buildRulesExportKey,
+  uploadFile,
+} from "../services/s3Service.js";
 import {
   assembleFieldRules,
   toPersistableAiRules,
@@ -43,12 +53,25 @@ const upload = multer({
   },
 });
 
+function parseStoredSourceFields(row) {
+  if (!row?.source_fields) return [];
+  if (Array.isArray(row.source_fields)) return row.source_fields;
+  if (typeof row.source_fields === "string") {
+    try {
+      return JSON.parse(row.source_fields);
+    } catch {
+      return [];
+    }
+  }
+  return row.source_fields;
+}
+
 router.get("/business-objects", requireAuth, (_req, res) => {
   res.json({ businessObjects: BUSINESS_OBJECTS });
 });
 
 /**
- * Parse Excel → review JSON (predefined + AI). Does NOT persist.
+ * Parse Excel → review JSON (predefined + AI). Caches draft when sourceSchemaId is provided.
  */
 router.post(
   "/generate",
@@ -57,6 +80,9 @@ router.post(
   async (req, res, next) => {
     try {
       const businessObject = String(req.body?.businessObject || "").trim();
+      const sourceSchemaId = String(req.body?.sourceSchemaId || "").trim();
+      const force =
+        String(req.query?.force || req.body?.force || "").toLowerCase() === "true";
 
       if (!isBusinessObject(businessObject)) {
         return res.status(400).json({
@@ -64,12 +90,52 @@ router.post(
         });
       }
 
-      if (!req.file?.buffer) {
-        return res.status(400).json({ error: "Excel file is required (field name: file)" });
+      if (sourceSchemaId && !force) {
+        const schema = await findSourceSchemaByIdForUser(
+          sourceSchemaId,
+          req.user.id,
+        );
+        if (!schema) {
+          return res.status(404).json({ error: "Source schema not found" });
+        }
+
+        const cached = await findRulesDraft(sourceSchemaId, businessObject);
+        if (cached) {
+          await upsertWorkspaceState(req.user.id, {
+            activeSourceSchemaId: sourceSchemaId,
+            selectedBusinessObject: businessObject,
+          });
+
+          return res.status(200).json({
+            businessObject: cached.business_object,
+            rules: cached.rules,
+            sourceSchemaId,
+            cached: true,
+            persisted: false,
+            message: "Returned cached rules draft for this file and business object",
+          });
+        }
       }
 
-      const fields = parseFieldMetadataExcel(req.file.buffer);
-      validateFieldMetadata(fields);
+      let fields;
+      if (sourceSchemaId) {
+        const schema = await findSourceSchemaByIdForUser(
+          sourceSchemaId,
+          req.user.id,
+        );
+        if (!schema) {
+          return res.status(404).json({ error: "Source schema not found" });
+        }
+        fields = parseStoredSourceFields(schema);
+        validateFieldMetadata(fields);
+      } else if (req.file?.buffer) {
+        fields = parseFieldMetadataExcel(req.file.buffer);
+        validateFieldMetadata(fields);
+      } else {
+        return res.status(400).json({
+          error: "Excel file or sourceSchemaId is required",
+        });
+      }
 
       const sourceFields = toBusinessObjectJson(businessObject, fields);
       const aiByField = await generateAiRulesWithBedrock(
@@ -79,11 +145,39 @@ router.post(
       );
       const rules = assembleFieldRules(businessObject, fields, aiByField);
 
+      if (sourceSchemaId) {
+        const rulesPayload = {
+          businessObject,
+          sourceFields,
+          rules,
+          generatedAt: new Date().toISOString(),
+        };
+        const outputKey = buildRulesExportKey({ sourceSchemaId, businessObject });
+        await uploadFile({
+          key: outputKey,
+          body: Buffer.from(JSON.stringify(rulesPayload, null, 2), "utf8"),
+          contentType: "application/json",
+        });
+
+        await upsertRulesDraft({
+          sourceSchemaId,
+          businessObject,
+          rules,
+          createdBy: req.user.id,
+          outputS3Key: outputKey,
+        });
+        await upsertWorkspaceState(req.user.id, {
+          activeSourceSchemaId: sourceSchemaId,
+          selectedBusinessObject: businessObject,
+        });
+      }
+
       return res.status(200).json({
         businessObject,
-        // Returned for UI review only — NOT saved to DB
         sourceFields,
         rules,
+        sourceSchemaId: sourceSchemaId || null,
+        cached: false,
         persisted: false,
         message:
           "Review predefined + AI rules. Save stores Business Object, field names, key flags (X = primary key), data types, lengths, and AI rules.",
@@ -100,7 +194,6 @@ router.post(
 
 /**
  * Persist: businessObject + fieldName + key (X = PK) + AI rules.
- * Predefined rules and other Excel metadata are not stored.
  */
 router.post("/save", requireAuth, async (req, res, next) => {
   try {

@@ -1,9 +1,14 @@
 import PDFDocument from "pdfkit";
 
-const BRAND_BLUE = "#008fd3";
-const HEADER_BG = "#0f1418";
-const TEXT_DARK = "#1c2024";
-const MUTED = "#5c6670";
+// Mirrors the frontend light theme tokens in app/globals.css so a downloaded
+// report matches the screen it was generated from.
+const BRAND_BLUE = "#0077b6";
+const HEADER_BG = "#0d4d92";
+const HEADER_SUBTITLE = "#cbe6ff";
+const TEXT_DARK = "#16202b";
+const MUTED = "#56626f";
+const TABLE_HEADER_BG = "#e3eefb";
+const TABLE_STRIPE_BG = "#f4f6fa";
 
 const FINDING_ROWS = [
   { key: "missingRecords", label: "Missing records" },
@@ -119,7 +124,7 @@ export function buildComparisonReportPdf(input) {
     doc
       .font("Helvetica")
       .fontSize(10)
-      .fillColor("#90cdff")
+      .fillColor(HEADER_SUBTITLE)
       .text("Comparison Validation Report", 50, 44, { width: pageWidth });
     doc.restore();
 
@@ -154,7 +159,7 @@ export function buildComparisonReportPdf(input) {
 
     // Table header
     doc.save();
-    doc.rect(colLabel, tableY, pageWidth, rowHeight).fill("#e8f6fc");
+    doc.rect(colLabel, tableY, pageWidth, rowHeight).fill(TABLE_HEADER_BG);
     doc
       .fillColor(BRAND_BLUE)
       .font("Helvetica-Bold")
@@ -168,7 +173,7 @@ export function buildComparisonReportPdf(input) {
       const count = countItems(summaryJson, row.key);
       if (index % 2 === 0) {
         doc.save();
-        doc.rect(colLabel, tableY, pageWidth, rowHeight).fill("#f7f9fb");
+        doc.rect(colLabel, tableY, pageWidth, rowHeight).fill(TABLE_STRIPE_BG);
         doc.restore();
       }
       doc

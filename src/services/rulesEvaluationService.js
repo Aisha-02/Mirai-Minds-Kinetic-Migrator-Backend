@@ -12,6 +12,7 @@ import {
 } from "./commonRules.js";
 import { resolveFieldColumn } from "../constants/fieldColumnAliases.js";
 import { prioritizeFieldRules, ruleSourceRank } from "./rulePriority.js";
+import { normalizePredefinedChecks } from "./assembleRules.js";
 
 const MAX_AFFECTED_ROWS_SAMPLE = 25;
 const MAX_SAMPLE_VALUES = 8;
@@ -278,6 +279,17 @@ function extractBusinessObject(rulesPayload) {
   );
 }
 
+function extractPredefinedChecks(rulesPayload) {
+  return normalizePredefinedChecks(
+    rulesPayload?.predefinedChecks || rulesPayload?.rules?.predefinedChecks,
+  );
+}
+
+function shouldApplyStoredRule(rule) {
+  if (rule?.selected === false || rule?.selected === null) return false;
+  return true;
+}
+
 function hasRule(rules, predicate) {
   return (rules || []).some(predicate);
 }
@@ -286,7 +298,7 @@ function hasRule(rules, predicate) {
  * Merge AI rules with predefined Null / Duplicate checks.
  * Duplicate Check is injected only when field.key === "X".
  */
-function enrichFieldsWithPredefined(fields) {
+function enrichFieldsWithPredefined(fields, checks) {
   const byName = new Map();
 
   for (const field of fields || []) {
@@ -294,9 +306,14 @@ function enrichFieldsWithPredefined(fields) {
     if (!fieldName) continue;
     const key = fieldKeyFlag(field);
     let rules = Array.isArray(field.rules) ? [...field.rules] : [];
-    if (key !== "X") {
-      rules = rules.filter((r) => !isDuplicateRule(r));
-    }
+    rules = rules.filter((rule) => {
+      if (!shouldApplyStoredRule(rule)) return false;
+      if (isTrimRule(rule) && !checks.trim) return false;
+      if (isNullEmptyRule(rule) && !checks.nullCheck) return false;
+      if (isDuplicateRule(rule) && !checks.duplicates) return false;
+      if (key !== "X" && isDuplicateRule(rule)) return false;
+      return true;
+    });
     byName.set(normalizeKey(fieldName), {
       fieldName,
       key,
@@ -310,8 +327,11 @@ function enrichFieldsWithPredefined(fields) {
       fieldName: field.fieldName,
       key: field.key,
     }).filter((rule) => {
-      if (rule.ruleId === COMMON_RULE_IDS.TRIM) return false;
-      if (rule.ruleId === COMMON_RULE_IDS.DUPLICATE && !isKey) return false;
+      if (rule.ruleId === COMMON_RULE_IDS.TRIM) return checks.trim;
+      if (rule.ruleId === COMMON_RULE_IDS.NULL_EMPTY) return checks.nullCheck;
+      if (rule.ruleId === COMMON_RULE_IDS.DUPLICATE) {
+        return checks.duplicates && isKey;
+      }
       return true;
     });
 
@@ -375,7 +395,8 @@ export function evaluateValidationRules(rows, rulesPayload) {
   const data = Array.isArray(rows) ? rows : [];
   const businessObject = extractBusinessObject(rulesPayload);
   const columnIndex = buildColumnIndex(data);
-  const fields = enrichFieldsWithPredefined(extractFields(rulesPayload));
+  const checks = extractPredefinedChecks(rulesPayload);
+  const fields = enrichFieldsWithPredefined(extractFields(rulesPayload), checks);
   const findings = [];
   const unmatchedFields = [];
   let rulesChecked = 0;

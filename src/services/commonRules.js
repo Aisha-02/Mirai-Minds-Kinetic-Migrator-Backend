@@ -1,6 +1,6 @@
 /**
- * Application-defined common rules for every uploaded field.
- * Always applied — independent of AI output.
+ * Application-defined common rules for uploaded fields.
+ * Injected at evaluation time when the matching admin toggle is on.
  * Canonical shape uses ruleName + source = "PREDEFINED".
  */
 

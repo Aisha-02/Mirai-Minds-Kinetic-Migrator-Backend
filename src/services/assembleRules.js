@@ -3,6 +3,20 @@ import { resolveFieldColumn } from "../constants/fieldColumnAliases.js";
 
 const PERSISTED_SOURCES = new Set([RULE_SOURCE.AI, RULE_SOURCE.CUSTOM]);
 
+export const DEFAULT_PREDEFINED_CHECKS = {
+  trim: true,
+  nullCheck: true,
+  duplicates: true,
+};
+
+export function normalizePredefinedChecks(checks) {
+  return {
+    trim: checks?.trim !== false,
+    nullCheck: checks?.nullCheck !== false,
+    duplicates: checks?.duplicates !== false,
+  };
+}
+
 export function normalizeRuleSource(value) {
   const source = String(value || "").trim().toUpperCase();
   if (source === RULE_SOURCE.PREDEFINED || source === "PREDEFINED") {
@@ -17,6 +31,7 @@ export function normalizeRuleSource(value) {
 function toAiRule(rule, index) {
   const ruleName =
     rule?.ruleName || rule?.rule || rule?.name || `AI Rule ${index + 1}`;
+  const hasSelected = rule != null && Object.prototype.hasOwnProperty.call(rule, "selected");
 
   return {
     ruleName: String(ruleName),
@@ -27,6 +42,7 @@ function toAiRule(rule, index) {
     constraint: rule?.constraint || "",
     severity: rule?.severity || "error",
     category: rule?.category || "validation",
+    selected: hasSelected ? rule.selected : null,
   };
 }
 
@@ -118,6 +134,7 @@ export function assembleFieldRules(
 
   return {
     businessObject,
+    predefinedChecks: normalizePredefinedChecks(null),
     fields: fieldRules,
   };
 }
@@ -138,6 +155,7 @@ function toPersistableRule(rule) {
     constraint: rule.constraint || "",
     severity: rule.severity || "error",
     category: rule.category || rule.type || "validation",
+    selected: rule.selected === undefined ? undefined : rule.selected,
   };
 
   if (source === RULE_SOURCE.CUSTOM) {
@@ -160,6 +178,9 @@ export function toPersistableAiRules(businessObject, rules) {
 
   return {
     businessObject: normalized.businessObject || businessObject,
+    predefinedChecks: normalizePredefinedChecks(
+      rules?.predefinedChecks || normalized.predefinedChecks,
+    ),
     fields: (normalized.fields || [])
       .map((field) => {
         const persistedRules = (field.rules || []).filter((rule) =>
@@ -208,6 +229,7 @@ export function normalizeRulesForPersistence(businessObject, rules) {
             severity: rule.severity,
             category: rule.category,
             keyEnforced: rule.keyEnforced,
+            selected: rule.selected,
             createdBy: rule.createdBy,
             createdAt: rule.createdAt,
             updatedBy: rule.updatedBy,
@@ -233,6 +255,7 @@ export function normalizeRulesForPersistence(businessObject, rules) {
 
     return {
       businessObject: rules.businessObject || businessObject,
+      predefinedChecks: normalizePredefinedChecks(rules.predefinedChecks),
       fields,
     };
   }
@@ -243,6 +266,7 @@ export function normalizeRulesForPersistence(businessObject, rules) {
 
   return {
     businessObject,
+    predefinedChecks: normalizePredefinedChecks(rules?.predefinedChecks),
     fields: [],
   };
 }

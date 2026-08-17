@@ -7,6 +7,7 @@ import comparisonRoutes from "./routes/comparisons.js";
 import rulesRoutes from "./routes/rules.js";
 import validationRoutes from "./routes/validation.js";
 import documentsRoutes from "./routes/documents.js";
+import assistantRoutes from "./routes/assistant.js";
 import { requestLogger } from "./middleware/requestLogger.js";
 
 const app = express();
@@ -16,10 +17,21 @@ if (!process.env.JWT_SECRET) {
   throw new Error("JWT_SECRET is required");
 }
 
+const corsOrigins = String(process.env.CORS_ORIGIN || "http://localhost:3000")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
 app.use(
   cors({
-    origin: process.env.CORS_ORIGIN || "http://localhost:3000",
+    origin(origin, callback) {
+      if (!origin || corsOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      return callback(null, false);
+    },
     credentials: true,
+    allowedHeaders: ["Content-Type", "Authorization"],
   }),
 );
 app.use(requestLogger);
@@ -35,6 +47,7 @@ app.use("/api/comparisons", comparisonRoutes);
 app.use("/api/rules", rulesRoutes);
 app.use("/api/validation", validationRoutes);
 app.use("/api/documents", documentsRoutes);
+app.use("/api/assistant", assistantRoutes);
 
 app.use((err, _req, res, _next) => {
   console.error(err);

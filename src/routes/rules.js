@@ -204,6 +204,55 @@ router.post(
 );
 
 /**
+ * Persist in-progress tick/toggle state to the workspace draft (not the published rule set).
+ */
+router.post("/draft", requireAuth, async (req, res, next) => {
+  try {
+    const businessObject = String(req.body?.businessObject || "").trim();
+    const sourceSchemaId = String(req.body?.sourceSchemaId || "").trim();
+    const rules = req.body?.rules;
+
+    if (!isBusinessObject(businessObject)) {
+      return res.status(400).json({
+        error: `businessObject must be one of: ${BUSINESS_OBJECTS.join(", ")}`,
+      });
+    }
+    if (!sourceSchemaId) {
+      return res.status(400).json({ error: "sourceSchemaId is required" });
+    }
+    if (!rules || typeof rules !== "object" || !Array.isArray(rules.fields)) {
+      return res.status(400).json({
+        error: "rules JSON with fields[] is required",
+      });
+    }
+
+    const schema = await findSourceSchemaByIdForUser(sourceSchemaId, req.user.id);
+    if (!schema) {
+      return res.status(404).json({ error: "Source schema not found" });
+    }
+
+    const saved = await upsertRulesDraft({
+      sourceSchemaId,
+      businessObject,
+      rules,
+      createdBy: req.user.id,
+    });
+
+    await upsertWorkspaceState(req.user.id, {
+      activeSourceSchemaId: sourceSchemaId,
+      selectedBusinessObject: businessObject,
+    });
+
+    return res.status(200).json({
+      message: "Selection state saved to workspace draft",
+      draftId: saved.id,
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+/**
  * Persist: businessObject + fieldName + key (X = PK) + AI rules.
  */
 router.post("/save", requireAuth, async (req, res, next) => {

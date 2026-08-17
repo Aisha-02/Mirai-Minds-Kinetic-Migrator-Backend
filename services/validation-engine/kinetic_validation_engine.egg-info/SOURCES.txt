@@ -11,7 +11,6 @@ tests/test_classify.py
 tests/test_engine.py
 tests/test_evaluate.py
 tests/test_payload.py
-tests/test_priority.py
 validation_engine/__init__.py
 validation_engine/classify.py
 validation_engine/columns.py
@@ -20,7 +19,6 @@ validation_engine/engine.py
 validation_engine/evaluate.py
 validation_engine/jsonutil.py
 validation_engine/payload.py
-validation_engine/priority.py
 validation_engine/readers.py
 validation_engine/rules.py
 validation_engine/storage.py

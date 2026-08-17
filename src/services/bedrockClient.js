@@ -188,12 +188,57 @@ function throwFromBedrockFailure(mapped) {
   throw error;
 }
 
+function toConverseRole(role) {
+  return String(role || "").toLowerCase() === "assistant"
+    ? ConversationRole.ASSISTANT
+    : ConversationRole.USER;
+}
+
+/**
+ * Bedrock Converse requires USER first, then alternating roles.
+ * @param {Array<{ role?: string, content?: string }>} messages
+ */
+export function normalizeConverseMessages(messages) {
+  const normalized = [];
+
+  for (const message of messages || []) {
+    const content = String(message?.content || "").trim();
+    if (!content) continue;
+    const role = toConverseRole(message.role);
+    const last = normalized[normalized.length - 1];
+    if (last && last.role === role) {
+      last.content[0].text = `${last.content[0].text}\n\n${content}`;
+      continue;
+    }
+    normalized.push({
+      role,
+      content: [{ text: content }],
+    });
+  }
+
+  if (normalized.length && normalized[0].role !== ConversationRole.USER) {
+    normalized.shift();
+  }
+
+  if (
+    !normalized.length ||
+    normalized[normalized.length - 1].role !== ConversationRole.USER
+  ) {
+    const error = new Error("Chat must end with a user message");
+    error.status = 400;
+    throw error;
+  }
+
+  return normalized;
+}
+
 /**
  * Call Amazon Bedrock Converse API and return the assistant text.
  *
  * @param {{
  *   systemText?: string,
- *   userText: string,
+ *   userText?: string,
+ *   messages?: Array<{ role?: string, content?: string }>,
  *   maxTokens?: number,
  *   temperature?: number,
  *   modelId?: string,
@@ -206,6 +251,7 @@ function throwFromBedrockFailure(mapped) {
 export async function converseText({
   systemText,
   userText,
+  messages,
   maxTokens,
   temperature,
   modelId,
@@ -222,14 +268,19 @@ export async function converseText({
   });
   assertBedrockConfig(config);
 
+  const converseMessages =
+    Array.isArray(messages) && messages.length > 0
+      ? normalizeConverseMessages(messages)
+      : [
+          {
+            role: ConversationRole.USER,
+            content: [{ text: String(userText || "") }],
+          },
+        ];
+
   const request = {
     modelId: config.modelId,
-    messages: [
-      {
-        role: ConversationRole.USER,
-        content: [{ text: userText }],
-      },
-    ],
+    messages: converseMessages,
     ...(systemText ? { system: [{ text: systemText }] } : {}),
     inferenceConfig: buildInferenceConfig({
       maxTokens: config.maxTokens,
